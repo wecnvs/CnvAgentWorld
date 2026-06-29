@@ -609,15 +609,17 @@ class WorkDecompositionTests(unittest.TestCase):
         self.assertIn("단계1 완료", r)             # 1차 체크포인트 보존
         self.assertIn("단계2 완료", r)             # 이어서 완료
 
-    def test_timeout_no_progress_does_not_loop(self):
+    def test_timeout_no_progress_bounded_retry_then_escalates(self):
+        # 무진행 타임아웃: 즉시 죽이지 않고 '체크포인트(골격)부터' 1회만 재시도(큰 작업이 읽기에 시간을
+        # 다 쓰고 시작도 못 하는 경우 구제) → 그래도 무진행이면 에스컬레이션. 여전히 유한(무한루프 아님).
         calls = {"n": 0}
         def fake(wdir, prompt):
             calls["n"] += 1
-            return "(엔진 타임아웃)"                # 아무 진행도 안 남김
+            return "(엔진 타임아웃)"                # 끝까지 아무 진행도 안 남김
         self.E.run_engine = fake
-        with self.assertRaises(Exception):         # 이어가지 않고 에러로 에스컬레이션
+        with self.assertRaises(Exception):         # 1회 재시도 후 에러로 에스컬레이션
             self.E.work(self.tok, self.sp, "멈추는 작업", context={})
-        self.assertEqual(calls["n"], 1)            # 진행 없으면 이어가지 않음(무한루프/비용폭주 방지)
+        self.assertEqual(calls["n"], 1 + self.E.WORK_NO_PROGRESS_RETRY_LIMIT)  # 초기 1 + 무진행 재시도 상한
 
 
 class RecoverLiveTaskTests(unittest.TestCase):

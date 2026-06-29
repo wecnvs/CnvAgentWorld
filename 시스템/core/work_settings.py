@@ -12,7 +12,11 @@ from .paths import PEOPLE, SPACES
 SETTINGS_FILENAME = "작업실행설정.json"
 
 DEFAULT_WORK_SETTINGS = {
-    "runner_timeout_sec": 300,
+    # 작업(work)은 채팅보다 무겁고 느린 엔진(예: Gemini)이 한 호출에 여러 파일을 읽고 쓰며 마지막 정리·
+    # release까지 한다. 300s는 좋은 산출을 내고도 막판에 타임아웃→error로 끝나기 일쑤였다(라이브 실증).
+    # 600s로 둬 단계 청크가 한 호출에 깨끗이 끝나게 한다. 무한이 아니라 유한 — 무진행 재시도·이어가기·
+    # 상한이 총 비용을 가둔다. (작업 단위는 law_work.md '큰 작업은 쪼갠다'로 작게 유지하는 게 우선.)
+    "runner_timeout_sec": 600,
     "heartbeat_interval_sec": 10,
     "heartbeat_stale_ms": 60_000,
     "progress_report_due_ms": 60_000,
