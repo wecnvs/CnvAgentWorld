@@ -1,0 +1,19 @@
+{
+  "manager-work-history": {
+    "enabled": true,
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "sh .agents/hooks/manager-history-check.sh agy-post-invocation",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "sh .agents/hooks/manager-history-check.sh agy-stop",
+        "timeout": 10
+      }
+    ]
+  }
+}

@@ -1,0 +1,162 @@
+  :root{
+    /* Light 테마 — 8686 대시보드(mac=light)와 동일 팔레트 */
+    --bg:#f5f5f7; --bg2:#ffffff; --bg3:#f0f0f2; --border:#d4d4d8;
+    --text:#1a1a1e; --text2:#6b6b7b; --accent:#7c6aef; --ok:#10a37f; --danger:#dc2626; --warn:#d97706;
+  }
+  body.os-windows{
+    --bg:#0e0e10; --bg2:#18181b; --bg3:#27272b; --border:#2e2e32;
+    --text:#ececf1; --text2:#8e8ea0; --accent:#7c6aef; --ok:#10a37f; --danger:#ef4444; --warn:#e5a200;
+  }
+  body.os-mac{
+    --bg:#f5f5f7; --bg2:#ffffff; --bg3:#f0f0f2; --border:#d4d4d8;
+    --text:#1a1a1e; --text2:#6b6b7b; --accent:#7c6aef; --ok:#10a37f; --danger:#dc2626; --warn:#d97706;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Malgun Gothic',sans-serif;}
+  #app{display:flex;height:100vh;width:100vw;overflow:hidden;position:relative}
+
+  /* 사이드바 — 세션 목록 (접기/펴기) */
+  #side{width:230px;min-width:230px;background:var(--bg2);border-right:1px solid var(--border);
+    display:flex;flex-direction:column;transition:transform .2s ease, width .2s ease, min-width .2s ease;}
+  #side.collapsed{width:0;min-width:0;border-right:none;transform:translateX(-100%);overflow:hidden}
+  #side .head{padding:10px 12px;border-bottom:1px solid var(--border);}
+  #side .head .ttl{font-size:13px;font-weight:700;letter-spacing:.3px}
+  #side .head .ws{font-size:10px;color:var(--text2);margin-top:3px;word-break:break-all;line-height:1.4}
+  .newbar{padding:8px 10px;display:flex;gap:6px;flex-wrap:wrap;border-bottom:1px solid var(--border)}
+  select,.btn{background:var(--bg3);color:var(--text);border:1px solid var(--border);
+    border-radius:6px;padding:6px 8px;font-size:12px;cursor:pointer}
+  select{flex:1;min-width:0}
+  .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:700}
+  .btn.primary:hover{filter:brightness(1.1)}
+  .btn:hover{background:var(--bg3)}
+  #sessList{flex:1;overflow-y:auto;padding:6px}
+  .sitem{display:flex;align-items:center;gap:6px;padding:10px 9px;border-radius:7px;cursor:pointer;
+    margin-bottom:4px;border:1px solid transparent}
+  .sitem:hover{background:var(--bg3)}
+  .sitem.active{background:var(--bg3);border-color:var(--accent)}
+  .sitem .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}
+  .sitem.dead .dot{background:var(--danger)}
+  .sitem .nm{flex:1;min-width:0;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sitem .nm small{display:block;color:var(--text2);font-size:10px}
+  .sitem .x{opacity:.45;color:var(--text2);font-size:16px;padding:0 6px}
+  .sitem:hover .x{opacity:1}
+  .sitem .x:hover{color:var(--danger)}
+  .empty{color:var(--text2);font-size:12px;text-align:center;padding:24px 10px;line-height:1.6}
+
+  /* 본문 — 터미널 */
+  #main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg)}
+  #tbar{height:38px;display:flex;align-items:center;gap:8px;padding:0 10px;border-bottom:1px solid var(--border);background:var(--bg2)}
+  #tbar .title{font-size:12.5px;font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #tbar .meta{font-size:10.5px;color:var(--text2)}
+  #tbar .tbtn{padding:4px 8px;font-size:11px}
+  .build-tag{color:#dc2626;font-weight:800;border:1px solid #dc2626;border-radius:5px;padding:1px 5px}
+  .danger-text{color:var(--danger)}
+  #sideToggle{padding:4px 9px;font-size:15px;line-height:1;flex:none}
+  /* 연결 상태 표시 — 점+텍스트(WS 상태에 따라 색/애니메이션) */
+  #connStat{display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--text2);flex:none;
+    padding:2px 7px;border:1px solid var(--border);border-radius:11px;background:var(--bg3)}
+  #connStat .cdot{width:8px;height:8px;border-radius:50%;background:var(--text2);flex:none;transition:background .2s}
+  #connStat.ok{color:var(--ok)} #connStat.ok .cdot{background:var(--ok)}
+  #connStat.warn{color:var(--warn)} #connStat.warn .cdot{background:var(--warn);animation:cblink 1s infinite}
+  #connStat.bad{color:var(--danger)} #connStat.bad .cdot{background:var(--danger)}
+  @keyframes cblink{50%{opacity:.25}}
+  /* 좁은 화면에선 상단바 혼잡 방지: 빌드태그 숨김, 연결상태 텍스트 숨김(점만 유지),
+     버튼 여백·간격 축소 + 제목 폭 제한으로 모든 버튼이 안 잘리고 들어오게 한다. */
+  @media (max-width:760px){
+    #buildTag{display:none}
+    #connStat .ctxt{display:none}
+    #connStat{padding:3px}
+    #tbar{gap:3px;padding:0 6px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+    #tbar .title{flex:0 1 auto;max-width:42vw}
+    #tbar .tbtn{padding:3px 6px}
+    #sideToggle{padding:3px 7px}
+  }
+  #termWrap{flex:1;position:relative;overflow:hidden}
+  /* 전용 투명 입력 오버레이 — 입력 생애주기를 100% JS가 통제(xterm textarea 미사용) */
+  #ovin{position:absolute;left:0;bottom:0;width:1px;height:1px;padding:0;margin:0;border:0;
+    opacity:0;color:transparent;background:transparent;caret-color:transparent;resize:none;
+    font-size:16px;line-height:16px;z-index:4;pointer-events:none;white-space:pre;overflow:hidden}
+  #term{position:absolute;inset:0;padding:6px 8px}
+  #placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    flex-direction:column;gap:10px;color:var(--text2);font-size:13px;text-align:center;padding:20px;line-height:1.7}
+  #placeholder .big{font-size:38px}
+  .placeholder-note{font-size:11px;color:#6b6b7a}
+  .hidden{display:none!important}
+  .file-input-hidden{display:none}
+  .empty.warn{color:var(--warn)}
+
+  /* xterm 네이티브 스크롤바(데스크탑/웹킷) */
+  .xterm-viewport::-webkit-scrollbar{width:11px}
+  .xterm-viewport::-webkit-scrollbar-track{background:transparent}
+  .xterm-viewport::-webkit-scrollbar-thumb{background:#c4c4cc;border-radius:6px;border:2px solid var(--bg2)}
+  .xterm-viewport::-webkit-scrollbar-thumb:hover{background:#a8a8b4}
+  .xterm-viewport{scrollbar-width:thin;scrollbar-color:#c4c4cc transparent}
+
+  /* 커스텀 오버레이 스크롤바 — 무조건 표시(세션 접속 시 항상 보임) */
+  #scrollOverlay{position:absolute;top:4px;right:2px;bottom:4px;width:22px;z-index:6;
+    opacity:0;transition:opacity .2s;pointer-events:none}
+  #scrollOverlay.show{opacity:1}
+  #scrollTrack{position:absolute;inset:0;background:rgba(0,0,0,.07);border-radius:7px}
+  #scrollThumb{position:absolute;right:0;width:22px;min-height:52px;border-radius:7px;
+    background:rgba(110,110,130,.72);pointer-events:auto;cursor:pointer;
+    box-shadow:0 0 0 1px rgba(0,0,0,.16)}
+  #scrollThumb:hover,#scrollThumb.drag{background:rgba(78,78,100,.95)}
+
+  /* [폰 UX 2026-06-12] 터미널 본문 세로 터치 스크롤을 항상 보장 (모든 내부 레이어에) */
+  #term,.xterm,.xterm-viewport,.xterm-screen,.xterm-rows,.xterm canvas{
+    touch-action:pan-y!important;-webkit-overflow-scrolling:touch}
+  /* ★평소엔 네이티브 텍스트 선택을 끈다 — 글자 위 터치가 '선택'으로 잡혀 스크롤이 멈추는 것 방지.
+     부분 선택은 '길게 누르기(long-press)' 후 JS(xterm.select)가 전담한다.
+     -webkit-touch-callout:none → iOS 길게누르기 시 시스템 복사메뉴가 뜨는 것도 차단. */
+  .xterm,.xterm *{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+
+  /* [폰 UX] '맨 아래로' 떠있는 버튼 — 하단 중앙, 바닥 아닐 때만 표시 */
+  #toBottom{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);z-index:7;
+    display:none;align-items:center;gap:6px;background:var(--accent);color:#fff;border:none;
+    border-radius:20px;padding:9px 18px;font-size:13px;font-weight:700;cursor:pointer;
+    box-shadow:0 4px 14px rgba(0,0,0,.3);-webkit-user-select:none;user-select:none}
+  #toBottom.show{display:inline-flex}
+  #toBottom:active{filter:brightness(1.12)}
+
+  /* [폰 UX] 선택/복사 토스트 */
+  #selToast{position:absolute;left:50%;top:46px;transform:translateX(-50%);z-index:8;
+    background:rgba(20,20,28,.92);color:#fff;padding:6px 14px;border-radius:14px;font-size:12px;
+    pointer-events:none;display:none;max-width:80%;text-align:center;line-height:1.4}
+  #selToast.show{display:block}
+
+  /* [폰 UX] 터치 가로채기 오버레이 — 터미널 위에 깔아 모든 터치를 선점(xterm canvas selection 원천차단).
+     터치 기기에서 세션 접속 시에만 표시. z-index: term < ovin(4) < catcher(5) < scrollbar(6) < 버튼(7) */
+  #touchCatcher{position:absolute;inset:0;z-index:5;display:none;background:transparent;touch-action:none}
+
+  /* [폰 UX] 선택 양끝 핸들 — 글자 아래에 떠서 드래그로 선택 범위 조정 */
+  .selHandle{position:absolute;width:22px;height:22px;border-radius:50%;background:var(--accent);
+    border:3px solid #fff;box-shadow:0 2px 7px rgba(0,0,0,.45);z-index:9;display:none;
+    margin-left:-11px;touch-action:none}
+  .selHandle.show{display:block}
+
+  /* 모바일 특수키 바 (입력은 터미널에 직접 — 별도 입력창 없음) */
+  #mobilebar{border-top:1px solid var(--border);background:var(--bg2);padding:6px}
+  #mkeys{display:flex;gap:5px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .mk{flex:none;background:var(--bg3);color:var(--text);border:1px solid var(--border);
+    border-radius:6px;padding:7px 11px;font-size:13px;cursor:pointer;min-width:42px}
+  .mk:active{background:var(--accent);color:#fff}
+  .mk.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  /* 붙여넣기 버튼 — 눈에 띄게 강조 */
+  .mk-paste{background:#1d3a5f;color:#cfe6ff;border-color:#2f5e8f;font-weight:700}
+  .mk-paste:active{background:#22c55e;color:#06210f;border-color:#22c55e}
+  .mk-copy{background:#3a2f5f;color:#e0d4ff;border-color:#5e4f8f;font-weight:700}
+  .mk-copy:active{background:#22c55e;color:#06210f;border-color:#22c55e}
+  .mk-img{background:#5f3a2f;color:#ffe0cf;border-color:#8f5e4f;font-weight:700}
+  .mk-img:active{background:#22c55e;color:#06210f;border-color:#22c55e}
+
+  /* 모바일 레이아웃 */
+  @media (max-width:760px){
+    #side{position:absolute;top:0;left:0;height:100%;z-index:30;width:78%;max-width:300px;min-width:0;
+      box-shadow:6px 0 24px rgba(0,0,0,.5)}
+    #backdrop{position:absolute;inset:0;background:rgba(0,0,0,.45);z-index:25}
+    #backdrop.hidden{display:none}
+  }
+  @media (min-width:761px){
+    #backdrop{display:none}
+  }

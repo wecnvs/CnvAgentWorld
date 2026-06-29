@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>CnvAgentWorld Terminal</title>
+<!-- xterm 로컬 동봉(self-host) — CDN/클라이언트 인터넷 의존 제거 -->
+<link rel="stylesheet" href="/static/xterm.min.css">
+<script src="/static/xterm.min.js"></script>
+<script src="/static/xterm-addon-fit.min.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <div id="backdrop" class="hidden" data-action="collapse-side"></div>
+  <div id="side">
+    <div class="head">
+      <div class="ttl">🖥️ Terminal</div>
+      <div class="ws" id="wsRoot">…</div>
+    </div>
+    <div class="newbar">
+      <select id="shellSel" title="셸 선택"></select>
+      <button class="btn primary" data-action="new-session" title="새 터미널">＋ 새 터미널</button>
+    </div>
+    <div id="sessList"><div class="empty">세션 불러오는 중…</div></div>
+  </div>
+  <div id="main">
+    <div id="tbar">
+      <button class="btn tbtn" id="sideToggle" data-action="toggle-side" title="목록 접기/펴기">☰</button>
+      <span class="title" id="curTitle">터미널 미선택</span>
+      <span class="meta" id="curMeta"></span>
+      <span id="connStat" title="연결 상태"><span class="cdot"></span><span class="ctxt">대기</span></span>
+      <span class="meta build-tag" id="buildTag">B:0614A</span>
+      <button class="btn tbtn" data-action="font-down" title="글자 작게">A−</button>
+      <button class="btn tbtn" data-action="font-up" title="글자 크게">A+</button>
+      <button class="btn tbtn" id="themeBtn" data-action="toggle-theme" title="라이트/다크 전환">🌓</button>
+      <button class="btn tbtn" data-action="rename-current" title="이름변경">✎</button>
+      <button class="btn tbtn" data-action="clear-current" title="화면지우기">⌫</button>
+      <button class="btn tbtn danger-text" data-action="kill-current" title="이 세션 종료">⨯</button>
+    </div>
+    <div id="termWrap">
+      <div id="term" class="hidden"></div>
+      <textarea id="ovin" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" aria-hidden="true"></textarea>
+      <div id="touchCatcher"></div>
+      <div id="selHandleStart" class="selHandle"></div>
+      <div id="selHandleEnd" class="selHandle"></div>
+      <div id="scrollOverlay"><div id="scrollTrack"></div><div id="scrollThumb"></div></div>
+      <button id="toBottom" title="맨 아래로">▼ 맨 아래로</button>
+      <div id="selToast"></div>
+      <div id="placeholder">
+        <div class="big">🖥️</div>
+        <div>왼쪽에서 <b>＋ 새 터미널</b>을 만들거나<br>기존 세션을 눌러 접속하세요.</div>
+        <div class="placeholder-note">이 터미널들은 이 서버(8687)에 영속으로 떠 있어<br>대시보드(8686)가 꺼져도 유지되고, 어느 기기에서든 재접속됩니다.</div>
+      </div>
+    </div>
+    <div id="mobilebar" class="hidden">
+      <div id="mkeys">
+        <button class="mk mk-paste" data-k="paste" title="붙여넣기 (Cmd+V / 클립보드)">📋 붙여넣기</button>
+        <button class="mk mk-copy" data-k="copy" title="선택영역 복사 (없으면 전체 화면)">📄 복사</button>
+        <button class="mk mk-img" data-k="attach" title="이미지/파일 첨부 → 저장 후 경로가 터미널에 입력됨">📎 첨부</button>
+        <button class="mk" data-k="ctrl" title="Ctrl 조합(다음 글자)">Ctrl</button>
+        <button class="mk" data-k="alt" title="Alt 조합(다음 글자)">Alt</button>
+        <button class="mk" data-k="enter" title="줄바꿈/실행(Enter)">⏎ Enter</button>
+        <button class="mk" data-k="esc">Esc</button>
+        <button class="mk" data-k="tab">Tab</button>
+        <button class="mk" data-k="up">↑</button>
+        <button class="mk" data-k="down">↓</button>
+        <button class="mk" data-k="left">←</button>
+        <button class="mk" data-k="right">→</button>
+        <button class="mk" data-k="home">Home</button>
+        <button class="mk" data-k="end">End</button>
+        <button class="mk" data-k="pgup">PgUp</button>
+        <button class="mk" data-k="pgdn">PgDn</button>
+        <button class="mk" data-k="del">Del</button>
+        <button class="mk" data-k="pipe">|</button>
+        <button class="mk" data-k="slash">/</button>
+        <button class="mk" data-k="tilde">~</button>
+        <button class="mk" data-k="dash">-</button>
+        <button class="mk" data-k="ctrlc">Ctrl-C</button>
+        <button class="mk" data-k="ctrld" title="EOF">Ctrl-D</button>
+        <button class="mk" data-k="ctrlz">Ctrl-Z</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="fileInput" class="file-input-hidden" accept="image/*,application/pdf,text/*">
+
+<script src="/static/js/state-theme.js"></script>
+<script src="/static/js/sessions-ui.js"></script>
+<script src="/static/js/terminal-core.js"></script>
+<script src="/static/js/input-upload.js"></script>
+<script src="/static/js/scrollbar.js"></script>
+<script src="/static/js/touch-selection.js"></script>
+<script src="/static/js/connection-actions.js"></script>
+<script src="/static/js/init.js"></script>
+</body>
+</html>

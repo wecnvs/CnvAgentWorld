@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh .claude/hooks/manager-history-stop.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

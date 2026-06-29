@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>CnvAgentWorld</title>
+  <link rel="stylesheet" href="/static/css/style.css?v=20260629-25">
+</head>
+<body>
+  <header class="topbar">
+    <h1>CnvAgentWorld <span class="build-tag">v2026</span></h1>
+    <div class="toolbar">
+      <button class="tool-btn layout-toggle" id="toggle-agents" type="button" data-layout-panel="agents" aria-pressed="true" aria-controls="people-panel">에이전트 접기</button>
+      <button class="tool-btn layout-toggle" id="toggle-spaces" type="button" data-layout-panel="spaces" aria-pressed="true" aria-controls="spaces-panel">공간 접기</button>
+      <button class="tool-btn layout-toggle" id="toggle-chat" type="button" data-layout-panel="chat" aria-pressed="true" aria-controls="chat-panel">채팅 접기</button>
+      <button class="tool-btn layout-toggle" id="toggle-viewer" type="button" data-layout-panel="viewer" aria-pressed="true" aria-controls="viewer">뷰어 접기</button>
+    </div>
+    <span id="status" class="status" title="서버 상태">●</span>
+  </header>
+
+  <div class="workspace">
+    <aside class="layout-panel people-pane" id="people-panel" data-layout-panel="agents">
+      <div class="panel-head">
+        <h2>에이전트</h2>
+        <div class="panel-actions">
+          <button id="add-person" class="mini" type="button" title="에이전트 생성">+</button>
+          <button class="panel-collapse" type="button" data-layout-panel="agents" aria-controls="people-panel">접기</button>
+        </div>
+      </div>
+      <section class="panel-body side-section">
+        <ul id="people-list" class="card-list"></ul>
+      </section>
+    </aside>
+
+    <div class="workspace-splitter" data-splitter-left="agents" data-splitter-right="spaces" role="separator" aria-orientation="vertical" aria-label="에이전트와 공간 패널 너비 조절" tabindex="0"></div>
+
+    <aside class="layout-panel spaces-pane" id="spaces-panel" data-layout-panel="spaces">
+      <div class="panel-head">
+        <h2>공간</h2>
+        <div class="panel-actions">
+          <button id="add-space" class="mini" type="button" title="공간 생성">+</button>
+          <button class="panel-collapse" type="button" data-layout-panel="spaces" aria-controls="spaces-panel">접기</button>
+        </div>
+      </div>
+      <section class="panel-body side-section">
+        <ul id="spaces-list" class="card-list"></ul>
+      </section>
+    </aside>
+
+    <div class="workspace-splitter" data-splitter-left="spaces" data-splitter-right="chat" role="separator" aria-orientation="vertical" aria-label="공간과 채팅 패널 너비 조절" tabindex="0"></div>
+
+    <main class="layout-panel chat-pane" id="chat-panel" data-layout-panel="chat">
+      <div class="panel-head">
+        <h2>공간대화</h2>
+        <button class="panel-collapse" type="button" data-layout-panel="chat" aria-controls="chat-panel">접기</button>
+      </div>
+      <section class="room-view" id="roomView">
+        <div class="room-head">
+          <div>
+            <h2 id="room-title">공간을 선택하세요</h2>
+            <div class="room-sub">공간 카드의 열기 버튼으로 들어갑니다</div>
+          </div>
+          <div class="room-status" id="room-status" data-state="unknown">상태 없음</div>
+          <form class="room-member-control" id="room-member-form" aria-label="공간 에이전트 입장">
+            <select id="room-member-select" aria-label="입장시킬 에이전트"></select>
+            <button class="ghost" id="room-member-join" type="submit">입장</button>
+          </form>
+          <button class="ghost" id="room-refresh">새로고침</button>
+        </div>
+        <div class="room-diagnostics-toolbar" id="room-diagnostics-toolbar" aria-label="상태 영역 표시 설정">
+          <button class="observer-toggle all" id="room-observer-all-toggle" type="button" aria-pressed="true" aria-controls="room-snapshot room-observer-stack">상태 접기</button>
+          <div class="observer-section-toggles" aria-label="상태 섹션 표시">
+            <button class="observer-toggle" type="button" data-observer-section="snapshot" aria-pressed="true" aria-controls="room-snapshot">요약</button>
+            <button class="observer-toggle" type="button" data-observer-section="status" aria-pressed="true" aria-controls="room-status-detail">상세</button>
+            <button class="observer-toggle" type="button" data-observer-section="flow" aria-pressed="true" aria-controls="room-chat-flow">흐름</button>
+            <button class="observer-toggle" type="button" data-observer-section="obligation" aria-pressed="true" aria-controls="room-obligation-panel">응답</button>
+            <button class="observer-toggle" type="button" data-observer-section="handoff" aria-pressed="true" aria-controls="room-turn-handoff">턴</button>
+            <button class="observer-toggle" type="button" data-observer-section="task" aria-pressed="true" aria-controls="room-task-panel">작업</button>
+            <button class="observer-toggle" type="button" data-observer-section="candidate" aria-pressed="true" aria-controls="room-candidate-panel">후보</button>
+            <button class="observer-toggle" type="button" data-observer-section="promotion" aria-pressed="true" aria-controls="room-promotion-review">성장</button>
+            <button class="observer-toggle" type="button" data-observer-section="activity" aria-pressed="true" aria-controls="room-activity">이력</button>
+          </div>
+        </div>
+        <div class="room-snapshot" id="room-snapshot" data-failures="no"></div>
+        <div class="room-observer-stack" id="room-observer-stack">
+          <div class="room-status-detail" id="room-status-detail" data-empty="yes"></div>
+          <section class="chat-flow-panel" id="room-chat-flow" data-empty="yes"></section>
+          <section class="obligation-panel" id="room-obligation-panel" data-empty="yes"></section>
+          <section class="turn-handoff-panel" id="room-turn-handoff" data-empty="yes"></section>
+          <section class="task-panel" id="room-task-panel" data-empty="yes"></section>
+          <section class="candidate-panel" id="room-candidate-panel" data-empty="yes"></section>
+          <section class="promotion-review-panel" id="room-promotion-review" data-empty="yes"></section>
+          <div class="room-activity" id="room-activity">
+            <div class="activity-empty">진행 상황 없음</div>
+          </div>
+        </div>
+        <div id="room-work-banner" class="room-work-banner" hidden></div>
+        <div class="room-messages" id="room-messages">
+          <div class="room-empty">공간을 선택하세요</div>
+        </div>
+        <input type="file" id="room-file" multiple class="hidden-file-input" aria-hidden="true" tabindex="-1">
+        <form class="room-form" id="room-form">
+          <div class="room-manager-lock">공간관리 항상 실행</div>
+          <textarea id="room-input" rows="2" placeholder="대표 메시지"></textarea>
+          <label class="ghost room-attach-btn" id="room-attach" for="room-file" title="파일 첨부" role="button" tabindex="0">📎</label>
+          <button class="primary" id="room-send" type="submit">보내기</button>
+        </form>
+      </section>
+    </main>
+
+    <div class="workspace-splitter" data-splitter-left="chat" data-splitter-right="viewer" role="separator" aria-orientation="vertical" aria-label="채팅과 뷰어 패널 너비 조절" tabindex="0"></div>
+
+    <aside class="layout-panel viewer-pane" id="viewer" data-layout-panel="viewer">
+      <div class="panel-head">
+        <h2>뷰어</h2>
+        <button class="panel-collapse" type="button" data-layout-panel="viewer" aria-controls="viewer">접기</button>
+      </div>
+      <div class="viewer-tabs">
+        <button class="vtab active" data-view="filesView">파일</button>
+        <button class="vtab" data-view="casesView">케이스</button>
+      </div>
+      <div class="views">
+        <section class="view" id="casesView">
+          <div class="cases-header">
+            <button id="cases-refresh" class="ghost" type="button">새로고침</button>
+            <span class="cases-hint">스킬의 경우의 수(케이스)를 검토 — candidate 승인/강등/폐기, 결과 표시</span>
+          </div>
+          <div id="cases-review-banner" class="cases-review-banner" hidden></div>
+          <div class="cases-split">
+            <ul class="cases-skill-list card-list" id="cases-skill-list"></ul>
+            <div class="cases-detail" id="cases-detail">
+              <div class="empty">스킬을 선택하세요</div>
+            </div>
+          </div>
+        </section>
+        <section class="view active" id="filesView">
+          <div class="files-header">
+            <nav class="breadcrumb" id="breadcrumb"></nav>
+          </div>
+          <div class="files-split">
+            <ul class="files-list" id="files-list"></ul>
+            <div class="files-splitter" id="files-splitter" role="separator" aria-orientation="horizontal" aria-label="파일 목록과 미리보기 높이 조절" tabindex="0"></div>
+            <div class="files-preview" id="files-preview">
+              <div class="empty">파일을 선택하세요</div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </aside>
+  </div>
+
+  <!-- 하단: 접이식 터미널 독 (8687 독립 앱을 iframe으로 임베드) -->
+  <section class="terminal-dock collapsed" id="terminal-dock">
+    <div class="dock-splitter" id="dock-splitter" title="드래그로 높이 조절"></div>
+    <div class="dock-head">
+      <span class="dock-title">터미널 <span class="dock-sub">:8687 독립 실행</span></span>
+      <a class="dock-open" id="term-open" target="_blank" title="새 창에서 열기">↗</a>
+      <button class="ghost" id="term-toggle" title="접기/펴기">▴</button>
+    </div>
+    <div class="term-frames" id="term-frames">
+      <iframe id="term-frame" class="term-frame" title="terminal"></iframe>
+    </div>
+  </section>
+
+  <div class="modal" id="person-modal" aria-hidden="true">
+    <form class="modal-panel" id="person-form">
+      <div class="modal-head">
+        <h2>에이전트 생성</h2>
+        <button type="button" class="ghost" id="person-cancel">닫기</button>
+      </div>
+      <label class="field">
+        <span>이름</span>
+        <input id="person-name" autocomplete="off" required>
+      </label>
+      <label class="field">
+        <span>엔진</span>
+        <select id="person-engine"></select>
+      </label>
+      <label class="field">
+        <span>모델</span>
+        <select id="person-model"></select>
+      </label>
+      <div class="modal-actions">
+        <button type="submit" class="primary">생성</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="modal" id="space-modal" aria-hidden="true">
+    <form class="modal-panel" id="space-form">
+      <div class="modal-head">
+        <h2>공간 생성</h2>
+        <button type="button" class="ghost" id="space-cancel">닫기</button>
+      </div>
+      <label class="field">
+        <span>이름</span>
+        <input id="space-name" autocomplete="off" required>
+      </label>
+      <label class="field">
+        <span>공간관리 엔진</span>
+        <select id="space-engine"></select>
+      </label>
+      <label class="field">
+        <span>공간관리 모델</span>
+        <select id="space-model"></select>
+      </label>
+      <div class="modal-actions">
+        <button type="submit" class="primary">생성</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="modal task-control-modal" id="task-control-modal" aria-hidden="true">
+    <form class="modal-panel" id="task-control-form">
+      <div class="modal-head">
+        <h2 id="task-control-title">작업 제어</h2>
+        <button type="button" class="ghost" id="task-control-cancel">닫기</button>
+      </div>
+      <label class="field">
+        <span id="task-control-label">내용</span>
+        <textarea id="task-control-input" rows="5"></textarea>
+      </label>
+      <div class="work-settings-note" id="task-control-note"></div>
+      <div class="modal-actions">
+        <button type="submit" class="primary" id="task-control-submit">요청</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="modal" id="person-picker-modal" aria-hidden="true">
+    <form class="modal-panel" id="person-picker-form">
+      <div class="modal-head">
+        <h2 id="person-picker-title">에이전트 선택</h2>
+        <button type="button" class="ghost" id="person-picker-cancel">닫기</button>
+      </div>
+      <label class="field">
+        <span>에이전트</span>
+        <select id="person-picker-select"></select>
+      </label>
+      <div class="work-settings-note" id="person-picker-note"></div>
+      <div class="modal-actions">
+        <button type="submit" class="primary" id="person-picker-submit">입장</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="modal" id="edit-modal" aria-hidden="true">
+    <form class="modal-panel wide" id="edit-form">
+      <div class="modal-head">
+        <h2 id="edit-title">편집</h2>
+        <button type="button" class="ghost" id="edit-cancel">닫기</button>
+      </div>
+      <div id="edit-runtime-wrap">
+        <label class="field">
+          <span>엔진</span>
+          <select id="edit-engine"></select>
+        </label>
+        <label class="field">
+          <span>모델</span>
+          <select id="edit-model"></select>
+        </label>
+      </div>
+      <div id="edit-work-settings-wrap" hidden>
+        <div class="work-settings-note" id="edit-work-settings-note" hidden></div>
+        <label class="field">
+          <span>Runner timeout (sec)</span>
+          <input id="edit-runner-timeout" type="number" min="30" max="7200" step="1">
+          <div class="work-override-row" hidden>
+            <input id="edit-runner-timeout-override" type="checkbox">
+            <span>이 좌석에서 지정</span>
+          </div>
+        </label>
+        <label class="field">
+          <span>Heartbeat interval (sec)</span>
+          <input id="edit-heartbeat-interval" type="number" min="1" max="300" step="1">
+          <div class="work-override-row" hidden>
+            <input id="edit-heartbeat-interval-override" type="checkbox">
+            <span>이 좌석에서 지정</span>
+          </div>
+        </label>
+        <label class="field">
+          <span>Heartbeat stale (ms)</span>
+          <input id="edit-heartbeat-stale" type="number" min="5000" max="3600000" step="1000">
+          <div class="work-override-row" hidden>
+            <input id="edit-heartbeat-stale-override" type="checkbox">
+            <span>이 좌석에서 지정</span>
+          </div>
+        </label>
+        <label class="field">
+          <span>Progress report due (ms)</span>
+          <input id="edit-progress-due" type="number" min="5000" max="3600000" step="1000">
+          <div class="work-override-row" hidden>
+            <input id="edit-progress-due-override" type="checkbox">
+            <span>이 좌석에서 지정</span>
+          </div>
+        </label>
+      </div>
+      <label class="field" id="edit-text-wrap" hidden>
+        <span>내용</span>
+        <textarea id="edit-text" rows="18"></textarea>
+      </label>
+      <div class="modal-actions">
+        <button type="submit" class="primary">저장</button>
+      </div>
+    </form>
+  </div>
+
+  <script type="module" src="/static/js/main.js?v=20260629-25"></script>
+</body>
+</html>
