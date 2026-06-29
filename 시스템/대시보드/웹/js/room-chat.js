@@ -1,8 +1,8 @@
 // 공간 채팅방 보기와 입력.
-import { api } from "./api.js?v=20260629-28";
-import { openWorkSettingsModal } from "./people.js?v=20260629-28";
-import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-28";
-import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-28";
+import { api } from "./api.js?v=20260629-29";
+import { openWorkSettingsModal } from "./people.js?v=20260629-29";
+import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-29";
+import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-29";
 
 let currentSpace = "";
 let refreshTimer = null;
@@ -205,6 +205,7 @@ function _observeText(el) {
 function _inlineFmt(s) {
   s = s.replace(EMBED_RE, (m, path, ext) =>
     `<span class="embed-pending" data-path="${path}" data-ext="${(ext || "").toLowerCase()}">${path}</span>`);
+  s = s.replace(/&lt;br\s*\/?&gt;/gi, "<br>");   // 의도적 줄바꿈만 허용(escape 후 — br은 속성 없어 안전)
   s = s.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
   s = s.replace(/`([^`]+)`/g, "<code class=\"md-ic\">$1</code>");
   // [텍스트](http…) 링크만 허용(스킴 제한 — javascript: 등 차단)
