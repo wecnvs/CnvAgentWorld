@@ -54,6 +54,8 @@ IGNORED_PARTS = {
     "임시",
     "node_modules",
     ".git",
+    ".run",      # 런타임 산출(서버 pid/log, watch 폴링 파일 등 — gitignored). 작업 이력 대상 아님:
+                 # 감시 기능이 .run/watch/*.md를 매 폴링마다 새로 써 가드가 영구 트립되던 문제 방지.
 }
 
 
