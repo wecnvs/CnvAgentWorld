@@ -1,8 +1,8 @@
 // 공간 채팅방 보기와 입력.
-import { api } from "./api.js?v=20260629-26";
-import { openWorkSettingsModal } from "./people.js?v=20260629-26";
-import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-26";
-import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-26";
+import { api } from "./api.js?v=20260629-27";
+import { openWorkSettingsModal } from "./people.js?v=20260629-27";
+import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-27";
+import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-27";
 
 let currentSpace = "";
 let refreshTimer = null;
@@ -213,7 +213,31 @@ function _inlineFmt(s) {
   return s;
 }
 
-// 말풍선 본문을 '마크다운 렌더링'한다(블록: 제목·목록·인용·구분선·코드블록·문단).
+// 표(테이블) 판별: 파이프 행 + 구분행(|---|:--:|).
+function _isTableRow(s) { return /\|/.test(s) && /\S/.test(s); }
+function _isTableSep(s) { return /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(s) && /\|/.test(s); }
+function _splitTableCells(s) {
+  let t = s.trim().replace(/^\|/, "").replace(/\|$/, "");   // 양끝 파이프 제거
+  return t.split("|").map((c) => c.trim());
+}
+function _tableAligns(sepCells) {
+  return sepCells.map((c) => {
+    const l = c.startsWith(":"), r = c.endsWith(":");
+    return r && l ? "center" : r ? "right" : l ? "left" : "";
+  });
+}
+function _renderTable(header, sep, bodyRows) {
+  const aligns = _tableAligns(_splitTableCells(sep));
+  const cell = (txt, i, tag) => {
+    const a = aligns[i] ? ` style="text-align:${aligns[i]}"` : "";
+    return `<${tag}${a}>${_inlineFmt(esc(txt))}</${tag}>`;
+  };
+  const head = _splitTableCells(header).map((c, i) => cell(c, i, "th")).join("");
+  const body = bodyRows.map((r) => `<tr>${_splitTableCells(r).map((c, i) => cell(c, i, "td")).join("")}</tr>`).join("");
+  return `<table class="md-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+// 말풍선 본문을 '마크다운 렌더링'한다(블록: 제목·목록·표·인용·구분선·코드블록·문단).
 // 파일 경로는 embed-pending으로 남겨 scanEmbeds가 미리보기로 승격(기존 동작 유지).
 function renderMessageBody(text) {
   try {
@@ -221,30 +245,41 @@ function renderMessageBody(text) {
     const out = [];
     let inList = false, inCode = false, codeBuf = [];
     const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
-    for (const raw of lines) {
+    let i = 0;
+    while (i < lines.length) {
+      const raw = lines[i];
       if (/^\s*```/.test(raw)) {                                   // 코드블록 펜스
         if (inCode) { out.push(`<pre class="md-code">${esc(codeBuf.join("\n"))}</pre>`); codeBuf = []; inCode = false; }
         else { closeList(); inCode = true; }
-        continue;
+        i++; continue;
       }
-      if (inCode) { codeBuf.push(raw); continue; }                 // 코드블록 내부는 그대로(서식·경로감지 안 함)
+      if (inCode) { codeBuf.push(raw); i++; continue; }            // 코드블록 내부는 그대로(서식·경로감지 안 함)
+      // 표: 헤더행 + 다음 줄이 구분행이면 표 블록을 소비한다.
+      if (_isTableRow(raw) && i + 1 < lines.length && _isTableSep(lines[i + 1])) {
+        closeList();
+        const header = raw, sep = lines[i + 1];
+        let j = i + 2; const bodyRows = [];
+        while (j < lines.length && _isTableRow(lines[j]) && lines[j].trim() !== "") { bodyRows.push(lines[j]); j++; }
+        out.push(_renderTable(header, sep, bodyRows));
+        i = j; continue;
+      }
       let m;
       if ((m = raw.match(/^(#{1,6})\s+(.*)$/))) {                  // 제목
-        closeList(); out.push(`<div class="md-h md-h${Math.min(m[1].length, 4)}">${_inlineFmt(esc(m[2]))}</div>`); continue;
+        closeList(); out.push(`<div class="md-h md-h${Math.min(m[1].length, 4)}">${_inlineFmt(esc(m[2]))}</div>`); i++; continue;
       }
       if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(raw)) {                // 구분선 ---, ***
-        closeList(); out.push('<hr class="md-hr">'); continue;
+        closeList(); out.push('<hr class="md-hr">'); i++; continue;
       }
       if ((m = raw.match(/^\s*>\s?(.*)$/))) {                      // 인용
-        closeList(); out.push(`<div class="md-quote">${_inlineFmt(esc(m[1]))}</div>`); continue;
+        closeList(); out.push(`<div class="md-quote">${_inlineFmt(esc(m[1]))}</div>`); i++; continue;
       }
       if ((m = raw.match(/^\s*(?:[-*+]|\d+\.)\s+(.*)$/))) {        // 목록(-, *, +, 1.)
         if (!inList) { out.push("<ul class=\"md-ul\">"); inList = true; }
-        out.push(`<li>${_inlineFmt(esc(m[1]))}</li>`); continue;
+        out.push(`<li>${_inlineFmt(esc(m[1]))}</li>`); i++; continue;
       }
       closeList();
-      if (raw.trim() === "") { out.push('<div class="md-sp"></div>'); continue; }
-      out.push(`<div class="md-p">${_inlineFmt(esc(raw))}</div>`);
+      if (raw.trim() === "") { out.push('<div class="md-sp"></div>'); i++; continue; }
+      out.push(`<div class="md-p">${_inlineFmt(esc(raw))}</div>`); i++;
     }
     if (inCode) out.push(`<pre class="md-code">${esc(codeBuf.join("\n"))}</pre>`);
     closeList();

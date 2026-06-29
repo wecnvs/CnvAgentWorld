@@ -855,6 +855,10 @@ body.files-resizing iframe { pointer-events: none; }
 .msg-body .md-ic { background: rgba(127,127,127,.16); border-radius: 4px; padding: 0 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .msg-body .md-code { margin: 6px 0; padding: 8px 10px; background: rgba(127,127,127,.12); border-radius: 8px; overflow-x: auto; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.45; }
 .msg-body a { color: #7cc4ff; text-decoration: underline; }
+.msg-body .md-table { border-collapse: collapse; margin: 6px 0; font-size: 12px; display: block; max-width: 100%; overflow-x: auto; }
+.msg-body .md-table th, .msg-body .md-table td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
+.msg-body .md-table th { background: rgba(127,127,127,.14); font-weight: 700; }
+.msg-body .md-table tr:nth-child(even) td { background: rgba(127,127,127,.05); }
 .msg-meta { margin-top: 5px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .msg-meta.error { color: #fda4af; }
 .room-form {
