@@ -8,7 +8,26 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
-from .paths import SPACES
+from .paths import SPACES, ROOT
+
+_ROOT_STR = str(ROOT)
+
+
+def _to_root_relative_paths(content: str) -> str:
+    """공개 말풍선의 파일 경로를 '루트기준 상대경로'로 정규화한다(공개 단일 지점).
+
+    에이전트(특히 Gemini)가 산출물을 `file:///Users/.../CnvAgentWorld/<rel>` 같은 절대경로·file:// URL로
+    적으면 (1) 대시보드 미리보기가 동작 안 하고(raw API는 루트상대만 serve) (2) /Users/<이름> 사용자명이
+    공개로 노출된다. ROOT 접두사를 떼어 상대경로로 바꾼다 — 스킬 가이드를 모델이 어겨도 시스템이 보정.
+    """
+    if not content or _ROOT_STR not in content:
+        return content
+    root = _ROOT_STR
+    return (content
+            .replace("file://" + root + "/", "")
+            .replace("file://" + root, "")
+            .replace(root + "/", "")
+            .replace(root, ""))
 from .transcript import now_iso, record
 from . import manager_claim, orchestration
 
@@ -225,6 +244,7 @@ def append_public_message(
     expected_message_id = deterministic_published_message_id(space, publish_effect_id)
     if published_message_id != expected_message_id:
         raise PublishLedgerError("published_message_id is not deterministic")
+    content = _to_root_relative_paths(content)   # 절대경로/file:// → 루트상대(미리보기 동작 + 사용자명 노출 차단)
     claim_contract = _claim_contract(manager_claim_token, manager_claim_context)
     publish_payload_hash = _payload_hash(
         speaker_name=speaker_name,

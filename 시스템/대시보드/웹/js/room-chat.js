@@ -1,8 +1,8 @@
 // 공간 채팅방 보기와 입력.
-import { api } from "./api.js?v=20260629-27";
-import { openWorkSettingsModal } from "./people.js?v=20260629-27";
-import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-27";
-import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-27";
+import { api } from "./api.js?v=20260629-28";
+import { openWorkSettingsModal } from "./people.js?v=20260629-28";
+import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-28";
+import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-28";
 
 let currentSpace = "";
 let refreshTimer = null;
@@ -119,9 +119,9 @@ const EMBED_KIND = (() => {
   return m;
 })();
 // esc() 적용 후 텍스트에서 '슬래시 포함 경로 + 확장자'를 찾는다(공백/꺾쇠 없는 토큰).
-// 백틱(`)·별표(*)도 제외한다 — 에이전트가 경로를 마크다운 `경로`/**경로**로 감싸면
-// 그 강조문자가 토큰 앞뒤에 붙어 raw 조회가 400으로 깨지던 버그(미리보기 안 뜸)를 막는다.
-const EMBED_RE = new RegExp(`([^\\s<>"'\`*]*\\/[^\\s<>"'\`*]*\\.(${EMBED_ALL.join("|")}))`, "gi");
+// 백틱(`)·별표(*)·괄호([]())도 제외한다 — 에이전트가 경로를 `경로`/**경로**/[라벨](경로)로 감싸면
+// 그 문자가 토큰 앞뒤에 붙어 raw 조회가 400으로 깨지던 버그(미리보기 안 뜸)를 막는다.
+const EMBED_RE = new RegExp(`([^\\s<>"'\`*()\\[\\]]*\\/[^\\s<>"'\`*()\\[\\]]*\\.(${EMBED_ALL.join("|")}))`, "gi");
 
 function fileRawURL(p) {
   if (/^\/api\/files\/raw/.test(p) || /^https?:\/\//.test(p)) return p;

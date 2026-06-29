@@ -1610,6 +1610,20 @@ class OrchestrationV0Tests(unittest.TestCase):
             room_manager.engine.run_engine = original
         self.assertEqual(room_manager.status(space)["tasks"]["task_count"], 0)
 
+    def test_publish_normalizes_absolute_and_fileurl_paths_to_root_relative(self):
+        # 회귀: 에이전트가 file:///Users/.../CnvAgentWorld/<rel> 절대경로/URL로 적어도 공개 직전에
+        # 루트상대로 보정한다(미리보기 동작 + 사용자명 노출 차단). 이미 상대경로면 그대로.
+        from core import publish_ledger
+        root = str(publish_ledger.ROOT)
+        cases = [
+            (f"[x.md](file://{root}/에이전트/a/작업/b/x.md)", "[x.md](에이전트/a/작업/b/x.md)"),
+            (f"결과: {root}/에이전트/a/작업/결과.md 확인", "결과: 에이전트/a/작업/결과.md 확인"),
+            ("에이전트/a/작업/결과.md", "에이전트/a/작업/결과.md"),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(publish_ledger._to_root_relative_paths(raw), expected)
+        self.assertNotIn(root, publish_ledger._to_root_relative_paths(cases[0][0]))
+
     def test_phase2_prompt_focuses_on_action_payload(self):
         # 2단계(스마트): 복잡 액션은 '전용 필드'만 선택지 나열해 받는다. 비대상 액션은 None(일반 재시도).
         members = {PREFIX + "m_a", PREFIX + "m_b"}
