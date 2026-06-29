@@ -131,6 +131,10 @@ WORK_STEERING_RESTART_LIMIT = 3
 # 끝까지 갈 기회를 주되(runner_timeout_sec×(1+이 값) ≈ 상한 예산), 멈춘 작업은 한 번에 에스컬레이션.
 # 무거운 분석(다수 파일 정독+긴 산출)이 상한에 걸려 헛되이 error 나던 걸 줄이려 3→6으로 올린다(여전히 유한).
 WORK_TIMEOUT_CONTINUE_LIMIT = 6
+# 무진행 타임아웃(첫 호출에서 결과.md에 아무것도 못 남김 — 보통 작업이 커서 읽기에 시간을 다 씀) 재시도 상한.
+# 즉시 에스컬레이션 대신 '체크포인트(골격)부터 써라' 1회 nudge를 줘서 큰 작업도 시작은 하게 한다.
+# 그래도 무진행이면 에스컬레이션(유한). 진짜 멈춘 작업이 예산을 끝없이 먹지 않게 1회로 제한.
+WORK_NO_PROGRESS_RETRY_LIMIT = 1
 
 # 진행 감지에서 제외할 '발판/계약/런타임' 파일들 — 이건 워커의 산출물이 아니다.
 _WORK_SCAFFOLD_FILES = {
@@ -641,6 +645,7 @@ def work(
     engine_attempt = 0
     revise_restarts = 0
     continue_restarts = 0      # 타임아웃 후 체크포인트에서 이어서 재실행한 횟수
+    no_progress_restarts = 0   # 무진행 타임아웃에서 '체크포인트부터' nudge로 재시도한 횟수
     continue_prompt = ""       # 이어서 재실행 시 주입할 안내
     while True:
         engine_attempt += 1
@@ -777,6 +782,22 @@ def work(
                         _work_heartbeat(
                             phase="engine_restarting_for_continue",
                             note=f"타임아웃+진행 감지(결과 {pre_run_result_len}->{post_len}자), 체크포인트에서 이어서 {continue_restarts}/{WORK_TIMEOUT_CONTINUE_LIMIT}",
+                        )
+                        continue
+                    # 무진행 타임아웃: 즉시 포기 대신 '체크포인트(골격)부터 써라' 1회 재시도(큰 작업 시작 유도).
+                    if (not made_progress) and (not _worker_done) and no_progress_restarts < WORK_NO_PROGRESS_RETRY_LIMIT:
+                        no_progress_restarts += 1
+                        continue_prompt = (
+                            "\n\n# 즉시 체크포인트부터(무진행 재시도)\n"
+                            "이전 실행이 제한시간 안에 `결과.md`에 아무것도 남기지 못했다(작업이 크거나 읽기에 시간을 다 씀). "
+                            "**무거운 읽기·탐색을 더 하기 전에, 가장 먼저** `결과.md`에 단계 체크리스트와 지금 당장 만들 수 있는 "
+                            "가장 작은 첫 산출(골격)을 써서 저장하라. 한 번에 다 하려 하지 말고 가장 작은 한 조각만 끝낸 뒤 "
+                            "`## 다음 단계`에 나머지를 남겨라(다음 실행이 거기서 이어간다).\n"
+                            f"(무진행 재시도 {no_progress_restarts}/{WORK_NO_PROGRESS_RETRY_LIMIT})\n"
+                        )
+                        _work_heartbeat(
+                            phase="engine_restarting_no_progress_checkpoint",
+                            note=f"타임아웃 무진행 — 체크포인트 우선 1회 재시도 {no_progress_restarts}/{WORK_NO_PROGRESS_RETRY_LIMIT}",
                         )
                         continue
                     _work_heartbeat(
