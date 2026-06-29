@@ -1,5 +1,5 @@
 // 에이전트 패널 렌더링과 동작.
-import { api } from "./api.js?v=20260629-25";
+import { api } from "./api.js?v=20260629-26";
 
 let engineCatalog = null;
 

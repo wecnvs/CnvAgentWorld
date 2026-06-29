@@ -842,6 +842,19 @@ body.files-resizing iframe { pointer-events: none; }
 .msg header strong { font-size: 13px; }
 .msg header span, .msg header time { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
 .msg-body { font-size: 13px; line-height: 1.55; word-break: break-word; }
+/* 말풍선 마크다운 렌더 */
+.msg-body .md-h { font-weight: 700; margin: 8px 0 4px; line-height: 1.35; }
+.msg-body .md-h:first-child { margin-top: 0; }
+.msg-body .md-h1 { font-size: 16px; } .msg-body .md-h2 { font-size: 15px; }
+.msg-body .md-h3 { font-size: 14px; } .msg-body .md-h4 { font-size: 13px; }
+.msg-body .md-p { margin: 3px 0; } .msg-body .md-p:first-child { margin-top: 0; }
+.msg-body .md-sp { height: 6px; }
+.msg-body .md-ul { margin: 4px 0 4px 18px; padding: 0; } .msg-body .md-ul li { margin: 2px 0; }
+.msg-body .md-quote { margin: 4px 0; padding: 2px 0 2px 10px; border-left: 3px solid var(--line); color: var(--muted); }
+.msg-body .md-hr { border: 0; border-top: 1px solid var(--line); margin: 8px 0; }
+.msg-body .md-ic { background: rgba(127,127,127,.16); border-radius: 4px; padding: 0 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.msg-body .md-code { margin: 6px 0; padding: 8px 10px; background: rgba(127,127,127,.12); border-radius: 8px; overflow-x: auto; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.45; }
+.msg-body a { color: #7cc4ff; text-decoration: underline; }
 .msg-meta { margin-top: 5px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .msg-meta.error { color: #fda4af; }
 .room-form {

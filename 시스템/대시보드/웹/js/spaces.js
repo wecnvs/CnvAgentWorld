@@ -1,7 +1,7 @@
 // 공간 패널 렌더링과 동작(생성·입장).
-import { api } from "./api.js?v=20260629-25";
-import { clearSpaceChatIfCurrent, openSpaceChat } from "./room-chat.js?v=20260629-25";
-import { openPersonPickerModal, openRuntimeModal, openTextModal, openWorkSettingsModal } from "./people.js?v=20260629-25";
+import { api } from "./api.js?v=20260629-26";
+import { clearSpaceChatIfCurrent, openSpaceChat } from "./room-chat.js?v=20260629-26";
+import { openPersonPickerModal, openRuntimeModal, openTextModal, openWorkSettingsModal } from "./people.js?v=20260629-26";
 
 let engineCatalog = null;
 

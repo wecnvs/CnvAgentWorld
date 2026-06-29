@@ -1,6 +1,6 @@
 // 스킬 케이스(경우의 수) 검토 패널 — 대표가 candidate를 승인/강등/폐기하고 결과(worked/harmful)를 표시한다.
 // §9.1: 자동 격리된 모순(conflict)을 전 스킬 통합 배너로 노출하고, 조건 좁혀 분기(branch)로 해소한다.
-import { api } from "./api.js?v=20260629-25";
+import { api } from "./api.js?v=20260629-26";
 
 let selectedSkill = null;
 let reviewIndex = {};   // skill name -> { conflicts, review }

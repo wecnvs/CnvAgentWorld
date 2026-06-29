@@ -1,8 +1,8 @@
 // 공간 채팅방 보기와 입력.
-import { api } from "./api.js?v=20260629-25";
-import { openWorkSettingsModal } from "./people.js?v=20260629-25";
-import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-25";
-import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-25";
+import { api } from "./api.js?v=20260629-26";
+import { openWorkSettingsModal } from "./people.js?v=20260629-26";
+import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-26";
+import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-26";
 
 let currentSpace = "";
 let refreshTimer = null;
@@ -200,15 +200,55 @@ function _observeText(el) {
   }
   _textObserver.observe(el);
 }
+// 말풍선 인라인 서식 — 입력은 '이미 escape된' 텍스트. 경로 미리보기(embed-pending)를 먼저 잡고
+// (경로엔 *·` 없음 → 이후 서식과 충돌 안 함) 굵게/코드/링크를 적용한다. XSS 안전(escape 선행).
+function _inlineFmt(s) {
+  s = s.replace(EMBED_RE, (m, path, ext) =>
+    `<span class="embed-pending" data-path="${path}" data-ext="${(ext || "").toLowerCase()}">${path}</span>`);
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/`([^`]+)`/g, "<code class=\"md-ic\">$1</code>");
+  // [텍스트](http…) 링크만 허용(스킴 제한 — javascript: 등 차단)
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    "<a href=\"$2\" target=\"_blank\" rel=\"noopener noreferrer\">$1</a>");
+  return s;
+}
+
+// 말풍선 본문을 '마크다운 렌더링'한다(블록: 제목·목록·인용·구분선·코드블록·문단).
+// 파일 경로는 embed-pending으로 남겨 scanEmbeds가 미리보기로 승격(기존 동작 유지).
 function renderMessageBody(text) {
   try {
-    // 경로는 일단 '대기' 스팬(plain text)으로 둔다. scanEmbeds가 실제 워크스페이스 파일인지
-    // 확인되면 미리보기로 승격하고, 아니면(본문에 적힌 상대/오타 경로 등) 그냥 텍스트로 남긴다.
-    // → 안 풀리는 경로가 '파일 아님' 같은 깨진 미리보기로 뜨던 문제 해결.
-    return esc(text || "")
-      .replace(EMBED_RE, (m, path, ext) =>
-        `<span class="embed-pending" data-path="${path}" data-ext="${(ext || "").toLowerCase()}">${path}</span>`)
-      .replace(/\n/g, "<br>");
+    const lines = String(text ?? "").split("\n");
+    const out = [];
+    let inList = false, inCode = false, codeBuf = [];
+    const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+    for (const raw of lines) {
+      if (/^\s*```/.test(raw)) {                                   // 코드블록 펜스
+        if (inCode) { out.push(`<pre class="md-code">${esc(codeBuf.join("\n"))}</pre>`); codeBuf = []; inCode = false; }
+        else { closeList(); inCode = true; }
+        continue;
+      }
+      if (inCode) { codeBuf.push(raw); continue; }                 // 코드블록 내부는 그대로(서식·경로감지 안 함)
+      let m;
+      if ((m = raw.match(/^(#{1,6})\s+(.*)$/))) {                  // 제목
+        closeList(); out.push(`<div class="md-h md-h${Math.min(m[1].length, 4)}">${_inlineFmt(esc(m[2]))}</div>`); continue;
+      }
+      if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(raw)) {                // 구분선 ---, ***
+        closeList(); out.push('<hr class="md-hr">'); continue;
+      }
+      if ((m = raw.match(/^\s*>\s?(.*)$/))) {                      // 인용
+        closeList(); out.push(`<div class="md-quote">${_inlineFmt(esc(m[1]))}</div>`); continue;
+      }
+      if ((m = raw.match(/^\s*(?:[-*+]|\d+\.)\s+(.*)$/))) {        // 목록(-, *, +, 1.)
+        if (!inList) { out.push("<ul class=\"md-ul\">"); inList = true; }
+        out.push(`<li>${_inlineFmt(esc(m[1]))}</li>`); continue;
+      }
+      closeList();
+      if (raw.trim() === "") { out.push('<div class="md-sp"></div>'); continue; }
+      out.push(`<div class="md-p">${_inlineFmt(esc(raw))}</div>`);
+    }
+    if (inCode) out.push(`<pre class="md-code">${esc(codeBuf.join("\n"))}</pre>`);
+    closeList();
+    return out.join("");
   } catch (_) {
     return esc(text || "").replace(/\n/g, "<br>");
   }
