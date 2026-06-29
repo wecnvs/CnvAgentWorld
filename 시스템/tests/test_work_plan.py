@@ -77,6 +77,14 @@ class AssessApprovalTest(unittest.TestCase):
         for dangerous in ("디스크 포맷 후 재설치", "드라이브 포맷해줘", "디스크 포맷하고 재설치"):
             self.assertIn("bulk_file_change", work_plan.detect_risk_signals(dangerous), dangerous)
 
+    def test_following_guidance_not_false_positive_guide_change(self):
+        # 회귀(라이브): '지침' 단독이 guide_change를 오탐해 '미리보기 지침에 맞춰 제출' 같은
+        # 지침을 '따르는' 작업까지 결재게이트에 걸렸다. 변경 의도/지침 파일일 때만 잡는다.
+        for benign in ("미리보기 지침에 맞춰 제출", "스킬 지침 참고해 작성", "공간지침 준수"):
+            self.assertEqual(work_plan.detect_risk_signals(benign), [], benign)
+        for danger in ("law.md 지침 수정", "공간지침을 바꾼다", "지침 변경"):
+            self.assertIn("guide_change", work_plan.detect_risk_signals(danger), danger)
+
     def test_high_cost_many_steps_escalates(self):
         steps = [f"{i}. 단계" for i in range(20)]
         a = work_plan.assess_approval("아주 큰 작업", steps, False)
