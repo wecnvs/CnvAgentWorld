@@ -1261,6 +1261,68 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertLess(res.get("auto_continue_turns", 0), room_manager.AUTO_CONTINUE_MAX_TURNS)
         self.assertTrue(any(e.get("type") == "manager_auto_continue_yielded" for e in res.get("events", [])))
 
+    def test_rapid_inputs_not_dropped_obligation_sweep(self):
+        # 회귀(라이브): 빠르게 연속으로 온 대표 메시지 2·3이 누락됐다. 매니저가 첫 입력만 처리하고
+        # 멈추면(stop), 빠르게 온 나머지는 read_until만 전진한 채 'open 응답의무'로 남아 답을 못 받는다.
+        # 종료 전 obligation sweep이 미응답 입력을 오래된 순으로 하나씩 구동해 모두 닫아야 한다.
+        space = PREFIX + "rapiddrop"
+        member = PREFIX + "agent_rd01"
+        make_space(space, [member])
+        original_run_engine = room_manager.engine.run_engine
+
+        def fake_run_engine(cwd, prompt, *args, **kwargs):
+            cwd = Path(cwd)
+            if cwd.name == MANAGER_DIRNAME:
+                # 자동 연속 턴에선 stop → 첫 입력만 처리하고 멈춘 '드롭' 상황을 재현.
+                # 그 외(최초 이벤트 + 누락방지 sweep)는 담당 멤버에게 pass해 그 입력을 답하게 한다.
+                if "자동 연속" in prompt:
+                    return json.dumps({"action": "stop", "wake": "", "message": "", "reason": "일단 멈춤"}, ensure_ascii=False)
+                return json.dumps({"action": "pass", "wake": member, "message": "답해줘", "reason": "응답"}, ensure_ascii=False)
+            return "네, 답변드립니다."
+
+        # 빠른 연속 3건 — 각자 응답의무를 연다(manager_requested=True). 실제 tick은 첫 입력 것 하나만 돌린다.
+        p1 = room_manager.post(space, "채널 이름 후보 3개", run_manager=False, manager_requested=True, client_message_id="rapid-0")
+        room_manager.post(space, "썸네일 톤은 어떤 색?", run_manager=False, manager_requested=True, client_message_id="rapid-1")
+        room_manager.post(space, "구독 유도 멘트 한 줄", run_manager=False, manager_requested=True, client_message_id="rapid-2")
+        # 처리 전: 3건 모두 open
+        before = response_obligation.snapshot(space)
+        self.assertEqual(before["state_counts"].get("open", 0), 3)
+
+        try:
+            room_manager.engine.run_engine = fake_run_engine
+            res = room_manager.tick(space, "첫 입력", p1["orchestration"], auto_continue=True)
+        finally:
+            room_manager.engine.run_engine = original_run_engine
+
+        # sweep이 미응답 입력 2건(2·3)을 하나씩 구동해 닫았다 — 누락 0.
+        sweep_events = [e for e in res.get("events", []) if e.get("type") == "manager_obligation_sweep"]
+        self.assertEqual(len(sweep_events), 2, res.get("events"))
+        after = response_obligation.snapshot(space)
+        self.assertEqual(after["state_counts"].get("open", 0), 0)
+        self.assertEqual(after["state_counts"].get("answered", 0), 3)
+
+    def test_obligation_sweep_off_when_auto_continue_disabled(self):
+        # 무회귀: auto_continue=False(기본·테스트·수동 tick)면 sweep은 돌지 않는다(한 tick=한 턴 계약 유지).
+        space = PREFIX + "nosweep"
+        member = PREFIX + "agent_ns01"
+        make_space(space, [member])
+        original_run_engine = room_manager.engine.run_engine
+
+        def fake_run_engine(cwd, prompt, *args, **kwargs):
+            if Path(cwd).name == MANAGER_DIRNAME:
+                return json.dumps({"action": "stop", "wake": "", "message": "", "reason": "멈춤"}, ensure_ascii=False)
+            return "ok"
+
+        p1 = room_manager.post(space, "메시지 A", run_manager=False, manager_requested=True, client_message_id="na-0")
+        room_manager.post(space, "메시지 B", run_manager=False, manager_requested=True, client_message_id="na-1")
+        try:
+            room_manager.engine.run_engine = fake_run_engine
+            res = room_manager.tick(space, "이벤트", p1["orchestration"])  # auto_continue 기본 False
+        finally:
+            room_manager.engine.run_engine = original_run_engine
+        self.assertEqual([e for e in res.get("events", []) if e.get("type") == "manager_obligation_sweep"], [])
+        self.assertNotIn("obligation_sweeps", res)
+
     def test_recover_space_redrives_stalled_manager_queued_state(self):
         # 서버 재시작 등으로 manager_queued(고아) 상태에 멈춘 공간을 recover_space가 재구동한다.
         space = PREFIX + "recoverstall"
@@ -1799,6 +1861,47 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertEqual(status["candidate_queue"]["pending_count"], 0)
         self.assertEqual(len(assistant_rows), 1)
         self.assertIn("합성된 공개 답변", assistant_rows[0]["내용"])
+
+    def test_pending_candidates_drained_after_chain_when_autocontinue_stops(self):
+        # 회귀(라이브): 자동 연속이 토론 턴을 다 써서 pending 후보를 못 비운 채 멈추면(stall),
+        # 체인 종료 전 candidate drain 안전망이 후보를 공개해 비운다 — 후보가 큐에 썩지 않게 한다.
+        space = PREFIX + "canddrain"
+        member_a = PREFIX + "agent_cda1"
+        member_b = PREFIX + "agent_cdb2"
+        make_space(space, [member_a, member_b])
+        post = room_manager.post(space, "두 관점 줘", run_manager=False, client_message_id="cd-1")
+        context = post["orchestration"]
+        original = room_manager.engine.run_engine
+
+        def fake(cwd, prompt, *a, **k):
+            if Path(cwd).name == MANAGER_DIRNAME:
+                pending = candidate_queue.snapshot(space)["pending_items"]
+                if "미공개 후보 정리" in prompt:                # candidate drain 턴: 실제 공개
+                    return json.dumps({
+                        "action": "publish_each",
+                        "candidate_ids": [i["candidate_id"] for i in pending],
+                        "wake": "", "message": "", "reason": "정리",
+                    }, ensure_ascii=False)
+                if pending:                                     # 자동 연속 턴: 후보 둔 채 계속 멈춤(stall)
+                    return json.dumps({"action": "stop", "wake": "", "message": "", "reason": "후보 둔 채 멈춤"}, ensure_ascii=False)
+                return json.dumps({                             # 첫 턴: 병렬 수집
+                    "action": "parallel_pass", "wake": "", "message": "", "reason": "두 관점",
+                    "targets": [{"wake": member_a, "message": "A"}, {"wake": member_b, "message": "B"}],
+                    "join_policy": "timeout_then_partial", "presentation_mode": "silent_reference",
+                }, ensure_ascii=False)
+            return f"{Path(cwd).parent.parent.name} 의견"
+
+        try:
+            room_manager.engine.run_engine = fake
+            result = room_manager.tick(space, "이벤트", context, auto_continue=True)
+        finally:
+            room_manager.engine.run_engine = original
+
+        drains = [e for e in result.get("events", []) if e.get("type") == "manager_candidate_drained"]
+        self.assertGreaterEqual(len(drains), 1, result.get("events"))
+        self.assertEqual(room_manager.status(space)["candidate_queue"]["pending_count"], 0)
+        assistant_rows = [r for r in read(space) if r.get("역할") == "assistant"]
+        self.assertEqual(len(assistant_rows), 2)               # 후보 2개 공개(잔류 0)
 
     def test_parallel_pass_obligation_stays_assigned_until_candidate_is_published(self):
         space = PREFIX + "parallelobligation"

@@ -39,7 +39,7 @@ def validate_skill(skill_path):
         return False, f"Invalid YAML in frontmatter: {e}"
 
     # Define allowed properties
-    # [BrainBase 정렬 2026-06-15 대표지시] 워크스페이스 실제 표준(142/142 스킬이 쓰는 de-facto)에 맞춰 version/status 허용.
+    # 워크스페이스 실제 표준(거의 모든 스킬이 쓰는 de-facto)에 맞춰 version/status도 허용.
     ALLOWED_PROPERTIES = {'name', 'description', 'license', 'allowed-tools', 'metadata', 'compatibility', 'version', 'status'}
 
     # Check for unexpected properties (excluding nested keys under metadata)
@@ -62,7 +62,7 @@ def validate_skill(skill_path):
         return False, f"Name must be a string, got {type(name).__name__}"
     name = name.strip()
     if name:
-        # [BrainBase 정렬 2026-06-15] 한글·대문자 포함 스킬명이 표준(자금수지업데이트, Autodesk로그인-컴퓨터유즈 등). 공백·구두점만 차단.
+        # 한글·대문자 포함 스킬명이 이 워크스페이스 표준이다. 공백·구두점만 차단(이름 규칙 최소화).
         if (not re.match(r'^[\w-]+$', name, re.UNICODE)) or (' ' in name):
             return False, f"Name '{name}' must have no spaces (letters/digits/Korean/hyphen only)"
         if name.startswith('-') or name.endswith('-') or '--' in name:

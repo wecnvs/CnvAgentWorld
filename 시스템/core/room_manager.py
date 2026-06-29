@@ -23,11 +23,26 @@ from .paths import PEOPLE
 from .codes import split_token
 
 MAX_DECISION_ATTEMPTS = 3
-MAX_REDRIVE_CHAIN = 3
-# 대표의 새 입력 없이 에이전트끼리 자동으로 협업 턴을 이어갈 최대 연속 횟수.
-# 런어웨이(매니저·에이전트 claude 연쇄 spawn) 방지를 위한 하드 캡. 매니저가 stop하면
-# 그 즉시 멈춰 대표에게 턴을 넘긴다(핸드백). 협업 단계(기획→구현→검수)+여유에 맞춰 보수적으로 잡는다.
-AUTO_CONTINUE_MAX_TURNS = 4
+# 체인이 claim을 쥔 동안 들어온 대표 입력을 release 후 재처리하는 redrive 최대 연쇄.
+# '실제로 들어온 미처리 입력'에만 반응하므로(허공에 안 돎) 캡을 올려도 빈 루프 비용이 없다.
+# 말풍선·에이전트가 늘면 한 처리 동안 더 많은 입력이 쌓일 수 있어 여유 있게 잡는다.
+MAX_REDRIVE_CHAIN = 6
+# 빠른 연속 입력 누락 방지: 체인이 끝났는데도 아직 답 안 된 대표 입력(open 응답의무)이 남아 있으면
+# 그 입력들을 가장 오래된 것부터 하나씩 명시해 매니저를 더 구동한다. 후보 정리 등에 턴을 쓰느라
+# 빠르게 온 입력을 '읽기만' 하고 답을 빠뜨린 경우를 닫는 최종 안전망.
+# ★ 진짜 런어웨이 방지는 '진전 없음 가드'(open 의무 집합이 줄지 않으면 즉시 멈춤)다 — 이 숫자 캡은
+# 보조 상한일 뿐이고, sweep은 '실제로 답 안 된 입력'당 한 번만 도므로 헛돌지 않는다. 따라서 말풍선/
+# 에이전트가 늘어 한 번에 여러 입력이 누락될 수 있는 상황에 맞춰 넉넉히 잡는다(실제 누락 수만큼만 비용 발생).
+MAX_OBLIGATION_SWEEPS = 8
+# 후보 잔류 방지: 체인이 끝나는데도 아직 방에 공개 안 된 pending 후보가 남아 있으면(자동연속이 토론
+# 턴을 다 써 버려 못 비웠거나 매니저가 멈춤) 공개/선택/합성/폐기로 비울 때까지 더 구동한다.
+# pending 후보 수가 줄지 않으면 멈춘다(무한루프 방지). '실제로 남은 후보'에만 반응하므로 헛돌지 않는다.
+MAX_CANDIDATE_DRAINS = 4
+# 대표의 새 입력 없이 에이전트끼리 자동으로 협업/토론 턴을 이어갈 최대 연속 횟수.
+# 런어웨이(매니저·에이전트 LLM 연쇄 spawn) 방지를 위한 하드 캡 — 위 두 캡과 달리 '추측성' 진행이라
+# 비용이 실입력과 무관하게 늘 수 있으므로 보수적으로 둔다. 매니저가 stop하면 즉시 멈춰 대표에게 넘긴다.
+# 멤버가 늘면 다자 토론(각자 1턴 + 반응 라운드 + 합성)·협업단계(기획→구현→검수→보완)가 길어져 6으로 둔다.
+AUTO_CONTINUE_MAX_TURNS = 6
 STATUS_STALE_MS = 30_000
 CHAT_AGENT_STALE_MS = 180_000
 MAX_PROMPT_SOURCE_CHARS = 4000
@@ -3346,6 +3361,89 @@ def _decision_is_publish_each(result: dict) -> bool:
     return bool((result or {}).get("ok")) and (result.get("decision") or {}).get("action") == "publish_each"
 
 
+def _pending_candidate_count(space: str) -> int:
+    try:
+        return int(candidate_queue.snapshot(space).get("pending_count") or 0)
+    except Exception:
+        return 0
+
+
+def _candidate_drain_event(pending: int, drain: int) -> str:
+    return (
+        f"미공개 후보 정리(잔류 방지 drain {drain}/{MAX_CANDIDATE_DRAINS}): "
+        f"CandidateQueue에 아직 방에 공개되지 않은 pending 후보 {pending}개가 남아 있다. "
+        "자동 연속 턴을 다 써서 못 비웠거나 멈춘 상태다. **새 토론 라운드(parallel_pass)를 시작하지 말고**, "
+        "이번 턴은 남은 후보를 정리해 비우는 데만 쓴다 — 여러 멤버가 각자 한마디씩 한 다자 대화면 "
+        "publish_each(candidate_ids)로 각 후보를 그 멤버 말풍선으로 공개, 그대로 쓸 후보 하나면 select_candidate, "
+        "여러 관점을 한 답으로 합칠 때만 synthesize_candidates, 쓰지 않을 후보는 discard_candidate. "
+        "정리할 후보가 없으면 stop."
+    )
+
+
+def _open_user_obligations(space: str) -> list[dict]:
+    """아직 답이 시작도 안 된(state='open') 대표 입력의 응답의무만 — 즉 '누락된' 입력.
+
+    assigned/delegated는 이미 멤버에게 넘겼거나 task로 진행 중(in-flight)이라 누락이 아니므로 제외한다.
+    open만이 매니저가 보긴 했어도(읽음) 아무 행동도 안 한, 빠른 연속 입력에서 빠뜨린 입력이다.
+    target_actor=space_manager(=open_for_message가 다는 값)인 대표 입력으로 한정한다.
+    """
+    try:
+        snap = response_obligation.snapshot(space)
+    except Exception:
+        return []
+    if snap.get("ledger_corrupt"):
+        return []
+    out = []
+    for item in snap.get("open_items") or []:
+        if item.get("state") != "open":
+            continue
+        if item.get("target_actor") not in ("space_manager", "space", ""):
+            continue
+        out.append(item)
+    out.sort(key=lambda it: _as_int(it.get("source_event_seq")))
+    return out
+
+
+def _obligation_sweep_event(target: dict, remaining: int, sweep: int) -> str:
+    # 한 sweep = 한 미응답 입력(가장 오래된 것)만 처리한다. 응답의무는 context 1건당 1건이 닫히므로
+    # 여러 건을 한 번에 답하라고 하면 나머지가 open으로 남아 stuck/중복이 된다 — 오래된 순으로 하나씩.
+    seq = target.get("source_event_seq")
+    text = str(target.get("source_text_preview") or "").replace("\n", " ").strip()[:200]
+    who = target.get("source_speaker") or "대표"
+    queued = (
+        f" (대기 중인 미응답 입력 {remaining - 1}건이 더 있다 — 그건 다음 턴에 차례로 처리되니 지금은 건드리지 마라.)"
+        if remaining > 1 else ""
+    )
+    return (
+        f"미응답 대표 입력 처리(빠른 연속 입력 누락 방지 sweep {sweep}/{MAX_OBLIGATION_SWEEPS}): "
+        "빠르게 연속으로 들어온 아래 대표 입력이 아직 아무 답도 받지 못한 채(open 응답의무) 남아 있다. "
+        "직전 턴들에서 다른 후보 정리/먼저 온 입력에만 답하느라 이 입력을 빠뜨렸다. "
+        "이번 턴은 바로 이 입력 하나에만 답한다 — 의도를 보고 가장 적합한 멤버에게 pass해 답하게 하라"
+        "(질문·잡담이면 채팅 즉답, 작업이면 그 흐름). 이미 끝난 다른 일은 건드리지 마라."
+        f"{queued}\n"
+        f"## 처리할 미응답 대표 입력 (event_seq={seq})\n{who}: {text}"
+    )
+
+
+def _obligation_sweep_context(target: dict) -> dict:
+    return {
+        "intent_id": target.get("intent_id", ""),
+        "conversation_thread_id": target.get("conversation_thread_id", ""),
+        "room_generation": target.get("room_generation"),
+        "source_event_seq": target.get("source_event_seq"),
+        "source_message_id": target.get("source_message_id", ""),
+        "coalesced_pending_inputs": [{
+            "event_seq": target.get("source_event_seq"),
+            "message_id": target.get("source_message_id", ""),
+            "intent_id": target.get("intent_id", ""),
+            "conversation_thread_id": target.get("conversation_thread_id", ""),
+            "room_generation": target.get("room_generation"),
+            "text_preview": target.get("source_text_preview", ""),
+            "recorded_at": target.get("updated_at", ""),
+        }],
+    }
+
+
 def _run_tick_chain(space: str, event: str, context: dict | None = None, *, auto_continue: bool = False) -> dict:
     result = _tick_unlocked(space, event, context)
     combined = dict(result)
@@ -3473,6 +3571,76 @@ def _run_tick_chain(space: str, event: str, context: dict | None = None, *, auto
             break
     if drain_runs:
         combined["redrive_drains"] = drain_runs
+    # 후보 잔류 방지: 체인이 끝나는데 아직 공개 안 된 pending 후보가 남아 있으면(자동연속이 토론 턴을 다
+    # 써서 못 비웠거나 멈춤) 공개/선택/합성/폐기로 비운다. pending 수가 안 줄면 멈춤(무한루프 방지).
+    # 의무 sweep보다 먼저 — 후보 공개가 응답의무를 닫아 sweep이 중복 응답하는 일을 줄인다.
+    candidate_drains = 0
+    prev_pending = -1
+    while (
+        auto_continue
+        and candidate_drains < MAX_CANDIDATE_DRAINS
+        and not (result.get("claim_busy") or result.get("stale") or result.get("claim_corrupt"))
+    ):
+        pending = _pending_candidate_count(space)
+        if pending == 0:
+            break
+        if pending == prev_pending:
+            break                                      # 직전 drain으로도 안 줄음 → 진전 없음, 멈춤
+        prev_pending = pending
+        candidate_drains += 1
+        combined["events"].append({
+            "type": "manager_candidate_drained",
+            "drain": candidate_drains,
+            "pending_count": pending,
+        })
+        result = _tick_unlocked(space, _candidate_drain_event(pending, candidate_drains), None)
+        combined["events"].extend(result.get("events") or [])
+        if "decision" in result:
+            combined["decision"] = result["decision"]
+        combined["ok"] = bool(combined.get("ok", True) and result.get("ok", False))
+        if result.get("claim_busy") or result.get("stale"):
+            break
+    if candidate_drains:
+        combined["candidate_drains"] = candidate_drains
+    # 빠른 연속 입력 누락 방지(최종 안전망): redrive/자동연속/drain까지 끝났는데도 아직 답이 시작도
+    # 안 된 대표 입력(open 응답의무)이 남아 있으면 — 매니저가 후보 정리나 한 입력에만 답하느라 빠르게
+    # 온 나머지를 '읽기만' 하고 빠뜨린 경우 — 그 입력들을 명시해 한 번 더 구동해 닫는다. open 의무
+    # 집합이 직전과 같으면(줄지 않으면) 멈춘다(무한루프 방지). bounded by MAX_OBLIGATION_SWEEPS.
+    obligation_sweeps = 0
+    prev_open_key: tuple | None = None
+    while (
+        auto_continue
+        and obligation_sweeps < MAX_OBLIGATION_SWEEPS
+        and not (result.get("claim_busy") or result.get("stale") or result.get("claim_corrupt"))
+    ):
+        open_items = _open_user_obligations(space)
+        if not open_items:
+            break
+        open_key = tuple(sorted(str(it.get("obligation_id") or "") for it in open_items))
+        if open_key == prev_open_key:
+            break                                      # 직전 sweep으로도 안 줄음 → 진전 없음, 멈춤
+        prev_open_key = open_key
+        obligation_sweeps += 1
+        target = open_items[0]                          # 가장 오래된 미응답 입력부터 하나씩
+        combined["events"].append({
+            "type": "manager_obligation_sweep",
+            "sweep": obligation_sweeps,
+            "open_count": len(open_items),
+            "target_event_seq": target.get("source_event_seq"),
+        })
+        result = _tick_unlocked(
+            space,
+            _obligation_sweep_event(target, len(open_items), obligation_sweeps),
+            _obligation_sweep_context(target),
+        )
+        combined["events"].extend(result.get("events") or [])
+        if "decision" in result:
+            combined["decision"] = result["decision"]
+        combined["ok"] = bool(combined.get("ok", True) and result.get("ok", False))
+        if result.get("claim_busy") or result.get("stale"):
+            break
+    if obligation_sweeps:
+        combined["obligation_sweeps"] = obligation_sweeps
     last_decision = combined.get("decision") or {}
     if auto_turns > 0 and last_decision.get("action") == "stop":
         # 자동 연속이 매니저 stop으로 끝났다 = 대표에게 턴을 넘김(핸드백). 대시보드가 강조할 수 있게 알린다.
@@ -4482,7 +4650,10 @@ def _space_context(space: str, event: str, context: dict | None = None, manager_
         "  · 보완·수정·다시 만들기 등 '작업'이 필요한 요청이면, 담당 에이전트에게 pass하되 message에 '먼저 한 줄로 접수 답(public_reply)을 하고, 무거운 수정은 이 채팅 턴에서 직접 하지 말고 request_work로 작업을 만들어 진행하라'를 명시한다(채팅 턴에서 무거운 작업을 직접 하면 시간초과로 접수 답조차 사라진다).\n"
         "- 공간관리는 공개 말풍선으로 대표에게 직접 답하지 않는다. 반드시 action으로 턴을 넘기거나 멈춘다(대표 응답은 에이전트가 한다).\n"
         "- room_status.rapid_input.pending_input_count가 1보다 크면 빠른 연속 입력이다. 이번 이벤트 하나만 보지 말고 "
-        "rapid_input.pending_items와 최근 대화를 함께 읽어, 누락된 대표 입력이 없도록 하나의 다음 턴 결정에 반영한다.\n"
+        "rapid_input.pending_items와 최근 대화를 함께 읽어 누락된 대표 입력이 없게 하라. **단, '서로 다른' 질문 여러 개를 "
+        "parallel_pass 하나로 묶지 마라** — parallel_pass는 '한 주제에 여러 의견'이 필요할 때만 쓴다. 빠르게 온 게 서로 다른 "
+        "질문/요청이면 각각을 개별 pass로 따로 처리해 입력 하나가 응답 하나로 깔끔히 닫히게 한다(한 턴에 한 입력만 답해도 된다 — "
+        "남은 입력은 시스템이 다음 턴으로 자동 이어 처리한다). 그래야 형제 입력이 안 닫힌 채 중복 응답·잔류로 남지 않는다.\n"
         "- 대표의 발언이 일상 대화, 인사, 짧은 질문, 능력 확인처럼 방 안 대화로 자연스럽게 이어질 수 있으면 "
         "공간 지침과 멤버 역할을 보고 가장 적합한 참여 에이전트에게 pass한다.\n"
         "- 대표의 발언이 구현, 파일 수정, 조사, 검토, 장기 작업, 여러 관점 비교, 결재가 필요한 결과 공개에 가깝다면 "
