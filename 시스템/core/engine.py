@@ -126,8 +126,11 @@ def run_engine(cwd, prompt: str, engine: str = None, model: str = None, timeout:
 _ORIGINAL_RUN_ENGINE = run_engine
 WORK_STEERING_RESTART_LIMIT = 3
 # 타임아웃 + 부분 진행이 있을 때 체크포인트에서 이어서 재실행하는 횟수 상한(작업 분할/누적).
-# 무한루프·비용폭주 방지: 진행이 늘었을 때만, 이 횟수 안에서만 이어서 한다(연구: 분할+체크포인트가 최고 신뢰성).
-WORK_TIMEOUT_CONTINUE_LIMIT = 3
+# 전략(터미널 CLI 에이전트 방식 차용): '진행이 있는 동안만' 이어가고, '진행이 없으면 즉시 멈춤'(가짜
+# 무한루프 차단). 즉 비용을 결정하는 건 시간이 아니라 '진행 여부'다 — 계속 나아가는 무거운 작업은
+# 끝까지 갈 기회를 주되(runner_timeout_sec×(1+이 값) ≈ 상한 예산), 멈춘 작업은 한 번에 에스컬레이션.
+# 무거운 분석(다수 파일 정독+긴 산출)이 상한에 걸려 헛되이 error 나던 걸 줄이려 3→6으로 올린다(여전히 유한).
+WORK_TIMEOUT_CONTINUE_LIMIT = 6
 
 # 진행 감지에서 제외할 '발판/계약/런타임' 파일들 — 이건 워커의 산출물이 아니다.
 _WORK_SCAFFOLD_FILES = {
@@ -556,6 +559,9 @@ def work(
         "- `steering/`에 새 파일이 있으면 `steering_seq`, `action`, `instruction`을 반영하고 work_status.json의 `last_seen_steering_seq`를 해당 seq 이상으로 갱신한다.\n"
         "- `request_progress`는 현재 진행/막힌 점/다음 단계/부분 결과를 체크포인트로 남기라는 요청이고, `revise_task`는 반영 전 결과가 자동 공개되지 않는 재지시다. 시스템 runner가 실행 중 revise를 감지하면 이 작업을 새 지시와 함께 재실행할 수 있다.\n"
         "- `취소요청.json`이 있으면 현재까지의 결과를 `결과.md`에 체크포인트로 남기고 `상태.json`을 `{\"상태\":\"cancelled\",\"사유\":\"취소 요청 반영\"}` 형태로 갱신한 뒤 멈춘다.\n"
+        "- **완료하면 '먼저' `상태.json`에 `{\"상태\":\"done\"}`을 기록하라(중요).** 산출물(결과.md·파일)이 사실상 완성되면 "
+        "요약·정리 같은 마지막 단계로 미루지 말고 done부터 박아라 — 마지막 단계에서 타임아웃돼도 '완료'가 보존돼 "
+        "결과가 방에 정상 공개된다(done 표시를 맨 끝으로 미루면, 막판 타임아웃 시 완료한 작업이 error로 처리될 수 있다).\n"
         "- 결과는 방에 직접 공개하지 않는다. `결과.md`, `상태.json`, 필요 시 `release_request.json` 초안으로 남긴다.\n"
         "- `task_pack.json`의 `lesson_pack.must_apply`가 비어 있지 않으면 `레슨적용보고.json`을 반드시 작성한다.\n"
         "- `레슨적용보고.json` 형식: "

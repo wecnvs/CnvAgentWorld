@@ -1578,10 +1578,22 @@ def _lesson_report_content(work_dir: Path) -> str:
 
 def _release_request(task_pack: dict, result: str, raw_status: dict, state: str) -> dict:
     context = _context_fields(task_pack)
-    release_kind = "final" if state == "done" else "blocked_report" if state == "blocked" else "partial"
+    # error(엔진 오류/타임아웃 포함)도 blocked처럼 '보고'로 surface한다 — 조용히 사라지지 않게(완료했는데
+    # 마지막 공개 단계만 타임아웃돼 결과가 갇히던 문제 해결). 대표가 산출을 보고 재개/재지시할 수 있다.
+    release_kind = "final" if state == "done" else "blocked_report" if state in ("blocked", "error") else "partial"
     verification = raw_status.get("verification") if isinstance(raw_status.get("verification"), dict) else {}
     if not verification:
         verification = {"status": "not_run", "not_run_reason": "legacy adapter did not receive verification report"}
+    reason = str(raw_status.get("사유") or raw_status.get("reason") or "").strip()
+    summary_body = result[:6000]
+    if state == "error":
+        # 결과는 완료(결과.md=✅)인데 마지막 엔진 호출만 타임아웃된 경우도 있고, 진짜 중단도 있다.
+        # 어느 쪽이든 '자동 보고가 끊겼다'는 사실 + 그때까지 산출을 방에 올려 대표가 판단하게 한다.
+        banner = (
+            f"⚠️ 작업 중 엔진 오류/타임아웃으로 자동 보고가 끊겼습니다(사유: {reason or '엔진 타임아웃'}). "
+            "아래는 그때까지의 산출·진행입니다 — 확인 후 재개/재지시해 주세요.\n\n"
+        )
+        summary_body = (banner + (result or "(산출물 없음 — 작업 초기에 중단됨)"))[:6000]
     return {
         "schema": "ReleaseRequest.v1",
         "release_id": _stable_id("rel", task_pack.get("task_id", ""), task_pack.get("task_pack_id", ""), state),
@@ -1596,8 +1608,8 @@ def _release_request(task_pack: dict, result: str, raw_status: dict, state: str)
         "room_generation": task_pack.get("room_generation"),
         "source_event_seq": task_pack.get("source_event_seq"),
         "answers_intent_id": task_pack.get("intent_id", ""),
-        "public_summary": result[:6000],   # 미리보기 경로(결과.md 후반)까지 살리려 1000→6000
-        "internal_notes": str(raw_status.get("사유") or raw_status.get("reason") or "")[:1000],
+        "public_summary": summary_body,   # 미리보기 경로(결과.md 후반)까지 살리려 1000→6000
+        "internal_notes": reason[:1000],
         "completeness": "complete" if state == "done" else "partial",
         "continue_after_release": False,
         "verification": verification,
@@ -1654,7 +1666,8 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
         verification = {"status": "not_run", "not_run_reason": "legacy adapter did not receive verification report"}
     release_request = {}
     release_enqueue = {}
-    if state in {"done", "blocked", "partial_ready"}:
+    # error(엔진 타임아웃 등)도 포함 — 완료/부분 산출이 조용히 사라지지 않고 방에 surface되게 한다.
+    if state in {"done", "blocked", "partial_ready", "error"}:
         release_request = _release_request(task_pack, result, raw_status, state)
     policy_fields = _work_policy_fields({
         **(task_pack.get("work_runtime_policy") or {}),
@@ -1735,7 +1748,9 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
         local_pending_steering = _pending_ack_steering(space, task_id, previous_work_status)
         local_release_request = release_request
         local_release_enqueue = release_enqueue
-        if not (state == "done" and local_release_request and not hold_reason):
+        # done뿐 아니라 error(엔진 타임아웃 등)도 enqueue→공개한다 — 완료/부분 산출이 조용히 사라지지 않게.
+        # blocked/partial_ready는 무언가(레슨·스티어링) 대기 중이라 draft로 보류(아래 특수처리), error는 surface.
+        if not (state in ("done", "error") and local_release_request and not hold_reason):
             return {
                 "cancel_info": local_cancel_info,
                 "pending_steering": local_pending_steering,

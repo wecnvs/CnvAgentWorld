@@ -4612,6 +4612,8 @@ class OrchestrationV0Tests(unittest.TestCase):
         original_run_engine = engine.run_engine
 
         def fake_run_engine(cwd, prompt, *args, **kwargs):
+            # 진행(결과.md)을 남긴 뒤 크래시 — '완료했는데 막판 오류'를 모사. 산출이 사라지면 안 된다.
+            (Path(cwd) / "결과.md").write_text("# 분석 완료\n핵심 결론: 8개 항목 정리함.", encoding="utf-8")
             raise RuntimeError("simulated engine crash")
 
         try:
@@ -4628,9 +4630,15 @@ class OrchestrationV0Tests(unittest.TestCase):
         work_status = json.loads((work_dirs[0] / "work_status.json").read_text(encoding="utf-8"))
         self.assertEqual(status["tasks"]["task_count"], 1)
         self.assertEqual(status["tasks"]["latest_state"], "error")
-        self.assertEqual(status["release_queue"]["release_count"], 0)
         self.assertEqual(work_status["state"], "error")
         self.assertIn("simulated engine crash", (work_dirs[0] / "상태.json").read_text(encoding="utf-8"))
+        # ★ 회귀(대표 라이브 발견): error여도 산출이 조용히 사라지지 않고 release로 surface돼야 한다.
+        self.assertEqual(status["release_queue"]["release_count"], 1)
+        pending = release_queue.snapshot(space).get("pending_items") or []
+        self.assertEqual(len(pending), 1)
+        summary = pending[0].get("public_summary", "")
+        self.assertIn("끊겼", summary)                       # 오류 배너(자동 보고 끊김 안내)
+        self.assertIn("분석 완료", summary)                   # 그때까지의 산출도 함께 실림
 
     def test_run_engine_polling_terminates_process_when_cancel_check_turns_true(self):
         space = PREFIX + "pollcancel"
@@ -5388,7 +5396,8 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertEqual(result["상태"], "error")
         self.assertFalse(status["tasks"]["latest_lesson_application_hold"])
         self.assertEqual(status["learning"]["evaluation_outcomes"].get("failed"), 1)
-        self.assertEqual(status["release_queue"]["release_count"], 0)
+        # error는 hold로 덮이지 않고(위), error 그대로 release로 surface된다(조용한 실패 제거).
+        self.assertEqual(status["release_queue"]["release_count"], 1)
 
     def test_engine_work_partial_ready_stays_draft_not_enqueued(self):
         space = PREFIX + "workpartial"
