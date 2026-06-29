@@ -1,6 +1,6 @@
 // 스킬 케이스(경우의 수) 검토 패널 — 대표가 candidate를 승인/강등/폐기하고 결과(worked/harmful)를 표시한다.
 // §9.1: 자동 격리된 모순(conflict)을 전 스킬 통합 배너로 노출하고, 조건 좁혀 분기(branch)로 해소한다.
-import { api } from "./api.js?v=20260629-29";
+import { api } from "./api.js?v=20260629-30";
 
 let selectedSkill = null;
 let reviewIndex = {};   // skill name -> { conflicts, review }
@@ -99,6 +99,9 @@ async function renderSkillDetail(skill) {
   if (!detail) return;
   detail.innerHTML = "";
   detail.append(el("div", "cases-detail-title", `${skill} — 케이스`));
+  detail.append(el("div", "cases-help",
+    "케이스는 만들어지면 다음부터 자동으로 사용됩니다(승인 불필요). 👍/👎는 에이전트 사용결과로 자동 집계되고, "
+    + "신뢰가 쌓이면 자동 승격됩니다. 대표님은 잘못된 케이스만 🗑 삭제하시면 됩니다."));
   let data;
   try {
     data = await api.skillCases(skill);
@@ -157,21 +160,25 @@ async function renderSkillDetail(skill) {
       card.append(cw);
     }
     const confTxt = (cv.confidence == null) ? "-" : cv.confidence;
+    // 사용 상태: 죽은 상태가 아니면 '다음에도 자동 사용됨'. 👍/👎는 에이전트 사용결과로 자동 집계.
+    const inUse = !["superseded", "retired", "expired", "graduated"].includes(c.status || "");
     card.append(el("div", "case-metrics",
-      `신뢰 ${confTxt} · worked ${cv.worked || 0} · harmful ${cv.harmful || 0} · 근거 ${c.evidence_level || "-"} · 발의 ${c.proposed_by || "-"}`));
+      `${inUse ? "✅ 자동 사용 중" : "⛔ 미사용"} · 👍 ${cv.worked || 0} · 👎 ${cv.harmful || 0} · 신뢰 ${confTxt}`
+      + ` · ${c.status === "active" ? "승격됨" : "신뢰 쌓이면 자동 승격"} · 발의 ${c.proposed_by || "-"}`));
 
     const actions = el("div", "case-actions");
     if (c.status === "conflict") {
       // 격리된 모순: 조건 좁혀 분기(권장) / 이 쪽 폐기 / 그래도 이 쪽 채택
       actions.append(act("✂ 분기(조건 좁히기)", "primary small", () => doBranch(skill, c.case_id)));
-      actions.append(act("이 케이스 폐기", "ghost small", () => api.retireCase(skill, c.case_id, "대표 모순해소: 이 쪽 폐기")));
-      actions.append(act("그래도 채택(active)", "ghost small", () => api.promoteCase(skill, c.case_id, "대표 모순해소: 이 쪽 채택")));
+      actions.append(act("🗑 삭제", "danger small", () => api.retireCase(skill, c.case_id, "대표 모순해소: 이 쪽 폐기")));
+      actions.append(act("그래도 채택", "ghost small", () => api.promoteCase(skill, c.case_id, "대표 모순해소: 이 쪽 채택")));
     } else {
-      if (c.status !== "active") actions.append(act("승인(active)", "primary small", () => api.promoteCase(skill, c.case_id, "대표 승인")));
-      if (c.status === "active" || c.status === "provisional_must") actions.append(act("강등", "ghost small", () => api.demoteCase(skill, c.case_id, "대표 강등")));
-      actions.append(act("폐기", "ghost small", () => api.retireCase(skill, c.case_id, "대표 폐기")));
-      actions.append(act("👍 worked", "ghost small", () => api.caseEvent(skill, c.case_id, "worked")));
-      actions.append(act("👎 harmful", "ghost small", () => api.caseEvent(skill, c.case_id, "harmful")));
+      // 주 액션: 잘못된 케이스 삭제(그만 쓰기). 나머지는 선택(보통 자동이라 손 댈 필요 없음).
+      actions.append(act("🗑 삭제(그만 쓰기)", "danger small", () => api.retireCase(skill, c.case_id, "대표 삭제: 잘못된 케이스")));
+      if (c.status !== "active") actions.append(act("지금 승격(선택)", "ghost small", () => api.promoteCase(skill, c.case_id, "대표 수동 승격")));
+      if (c.status === "active" || c.status === "provisional_must") actions.append(act("강등(선택)", "ghost small", () => api.demoteCase(skill, c.case_id, "대표 강등")));
+      actions.append(act("👍", "ghost small", () => api.caseEvent(skill, c.case_id, "worked")));
+      actions.append(act("👎", "ghost small", () => api.caseEvent(skill, c.case_id, "harmful")));
     }
     card.append(actions);
 

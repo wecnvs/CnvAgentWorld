@@ -1,8 +1,8 @@
 // 공간 채팅방 보기와 입력.
-import { api } from "./api.js?v=20260629-29";
-import { openWorkSettingsModal } from "./people.js?v=20260629-29";
-import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-29";
-import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-29";
+import { api } from "./api.js?v=20260629-30";
+import { openWorkSettingsModal } from "./people.js?v=20260629-30";
+import { setLayoutPanelCollapsed } from "./viewer.js?v=20260629-30";
+import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260629-30";
 
 let currentSpace = "";
 let refreshTimer = null;

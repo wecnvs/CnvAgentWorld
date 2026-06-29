@@ -1559,6 +1559,16 @@ def audit_reply_lesson_applications(
             try:
                 case_ledger.record_case_event(skill, case_id, event, by=agent, skill_id=skill, rationale=str(item.get("how") or "")[:300])
                 case_application_rows.append({"skill": skill, "case_id": case_id, "event": event})
+                # 자동 승격(대표 손 없이): worked가 누적돼 §9.1 게이트(신뢰 가능한 '독립' 확인자 ≥ 임계,
+                # harmful 0, conflict 아님)를 충족하면 candidate→active로 자동 수렴. 미충족이면 조용히 통과.
+                # 후보 케이스는 어차피 기본 사용되므로, 이 승격은 '우선순위 상향'일 뿐 — 안전(사이코펀시/자기confirm 차단).
+                if event == "worked":
+                    try:
+                        case_ledger.promote_case(skill, case_id, by="system_auto",
+                                                 rationale="worked 수렴 자동 승격(독립확인자 게이트)",
+                                                 method="worked_threshold")
+                    except Exception:
+                        pass   # 아직 수렴 안 됨/모순 격리 등 — 정상(다음 worked에서 재시도)
             except Exception:
                 continue   # 점진 도입 fail-safe: 케이스 기록 실패가 발행을 막지 않는다
 

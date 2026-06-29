@@ -1,14 +1,14 @@
 // 부팅과 조립만 한다.
-import { api } from "./api.js?v=20260629-29";
-import { renderPeople, wirePeople } from "./people.js?v=20260629-29";
-import { renderSpaces, wireSpaces } from "./spaces.js?v=20260629-29";
-import { openDir, wireFiles, startFilesAutoRefresh } from "./files.js?v=20260629-29";
-import { wireViewer } from "./viewer.js?v=20260629-29";
-import { wireRoomChat } from "./room-chat.js?v=20260629-29";
-import { wireTerminalDock } from "./terminal.js?v=20260629-29";
-import { setupMobileViewport } from "./mobile.js?v=20260629-29";
-import { setupMobileResize } from "./mobile-resize.js?v=20260629-29";
-import { renderCases, wireCases } from "./cases.js?v=20260629-29";
+import { api } from "./api.js?v=20260629-30";
+import { renderPeople, wirePeople } from "./people.js?v=20260629-30";
+import { renderSpaces, wireSpaces } from "./spaces.js?v=20260629-30";
+import { openDir, wireFiles, startFilesAutoRefresh } from "./files.js?v=20260629-30";
+import { wireViewer } from "./viewer.js?v=20260629-30";
+import { wireRoomChat } from "./room-chat.js?v=20260629-30";
+import { wireTerminalDock } from "./terminal.js?v=20260629-30";
+import { setupMobileViewport } from "./mobile.js?v=20260629-30";
+import { setupMobileResize } from "./mobile-resize.js?v=20260629-30";
+import { renderCases, wireCases } from "./cases.js?v=20260629-30";
 
 async function refreshAll() {
   await Promise.all([renderPeople(), renderSpaces()]);
