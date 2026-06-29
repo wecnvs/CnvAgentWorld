@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import re
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -1576,6 +1577,43 @@ def _lesson_report_content(work_dir: Path) -> str:
     return ""
 
 
+def _is_timeout_reason(reason: str) -> bool:
+    """실패 사유가 '엔진 타임아웃류'인지. (보고 턴만 끊긴 경우를 진짜 실패와 구분하기 위함)"""
+    r = str(reason or "")
+    rl = r.lower()
+    return ("타임아웃" in r) or ("timeout" in rl) or ("시간 초과" in r) or ("timeoutexpired" in rl)
+
+
+# 결과.md에서 작업자가 '명시적으로' 완료를 선언한 라인을 찾는 정규식(상태 선언만, 계획 언급 제외).
+# 보수적: `완료`는 (a)뒤에 한글이 붙은 형태(완료되지·완료됨 등)와 (b)부정·유보어(완료 안/못/예정/않 …)를
+# 제외한다 — '상태: 완료되지 않음'·'완료 예정' 같은 미완 표현을 done으로 오탐하지 않게(교차검증 지적).
+_DONE_DECL_RE = re.compile(
+    r"(최종\s*)?상태\s*[:：]\s*(done\b|완료(?![가-힣])(?!\s*(안|못|미|예정|전|않|불가|실패|보류|중)))",
+    re.IGNORECASE,
+)
+
+
+def _checkpoint_reports_done(result_md: str) -> bool:
+    """결과.md 체크포인트가 작업 완료를 '명시적으로' 선언했는지(보수적 판정).
+
+    엔진 타임아웃은 '보고 턴'만 끊을 뿐 작업 자체는 체크포인트상 완료일 수 있다(large-task-checkpointing).
+    오탐(미완을 완료로 승격)을 막기 위해, 미통과 체크리스트 항목(`- [ ]`) 안의 'done' 언급(=계획)은
+    제외하고, 상태 선언 라인(`상태: done`/`최종 상태: DONE`/`상태: 완료`) 또는 `완주(done)`만 완료로 본다.
+    """
+    if not result_md:
+        return False
+    for raw in result_md.splitlines():
+        if "- [ ]" in raw:          # 미통과(계획) 단계 — 완료 선언이 아니다
+            continue
+        line = raw.strip().lstrip(">").replace("#", "").replace("*", "").strip()
+        if _DONE_DECL_RE.search(line):
+            return True
+        low = line.lower()
+        if ("완주(done)" in low) or ("완주 (done)" in low):
+            return True
+    return False
+
+
 def _release_request(task_pack: dict, result: str, raw_status: dict, state: str) -> dict:
     context = _context_fields(task_pack)
     # error(엔진 오류/타임아웃 포함)도 blocked처럼 '보고'로 surface한다 — 조용히 사라지지 않게(완료했는데
@@ -1634,6 +1672,23 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
         latest = {}
     result = (work_dir / "결과.md").read_text(encoding="utf-8") if (work_dir / "결과.md").exists() else ""
     state = str(raw_status.get("상태") or raw_status.get("state") or "partial")
+    # C(타임아웃이 완료를 가리는 문제): 엔진이 '최종 보고 턴'에서 타임아웃나면 상태.json을 error로 덮어써,
+    # 작업이 체크포인트(결과.md)상 완료(예: 4/4 DONE)인데도 방엔 '⚠️ 타임아웃 에러'로만 떠 사회자·대표가
+    # 실패로 오인하고 정체된다(실증 2026-06-29 c6b6 seq45). 보고 턴 타임아웃은 작업 실패가 아니므로,
+    # state=="error"(타임아웃 사유) + 결과.md가 '명시적 완료'를 선언하면 done으로 화해해 정상 완료로 흘린다.
+    # 보수적: 타임아웃류 사유 + 명시 완료선언일 때만(미완을 done으로 오승격하지 않게). 그 외 error는 종전대로.
+    if state == "error":
+        _err_reason = str(raw_status.get("사유") or raw_status.get("reason") or "")
+        if _is_timeout_reason(_err_reason) and _checkpoint_reports_done(result):
+            state = "done"
+            raw_status = {
+                **raw_status,
+                "상태": "done",
+                "사유": f"체크포인트 완료 화해(보고 턴 타임아웃): {_err_reason[:160]}",
+                "completed_via_checkpoint": True,
+                "engine_timeout_reconciled": True,
+            }
+            _write_json(work_dir / "상태.json", raw_status)
     lesson_audit = {}
     hold_reason = ""
     report_content = _lesson_report_content(work_dir)
@@ -1956,6 +2011,33 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
             outcome = "partial"
     else:
         outcome = "rejected" if state in {"blocked", "cancelled"} else "failed" if state == "error" else "partial"
+    # 작업 실패 사유 문자열(타임아웃 판정·케이스화 근거). hold_reason > raw_status.사유 > state 순.
+    _fail_reason = str(hold_reason or raw_status.get("사유") or state or "unknown work status")
+    _fail_l = _fail_reason.lower()
+    _is_timeout_failure = ("타임아웃" in _fail_reason) or ("timeout" in _fail_l) or ("시간 초과" in _fail_reason)
+    # 타임아웃류 작업 실패는 자기성장 루프로 케이스화한다(체크포인트 재개·중복기동 방지 교훈 → 스킬 승격 후보).
+    # 종전엔 no_lesson_reason="...requires_review"로 punt돼, 이 방의 지배적 실패(엔진 타임아웃)가 5회+
+    # 반복돼도 케이스가 0이었다. wake_failed 핸들러(room_manager)와 같은 패턴으로 work-task 경로도 잇는다.
+    # instruction은 안정 문자열 → lesson_id가 내용기반 dedup되어 같은 타임아웃이 반복돼도 lesson이 폭증하지 않는다.
+    # 그 외 실패(blocked/cancelled/스키마 등)는 종전대로 수동검토 보류 — 회귀 최소화.
+    _task_lesson_candidate = None
+    if outcome != "success" and _is_timeout_failure:
+        _task_lesson_candidate = {
+            "kind": "lesson",
+            "scope": "space",
+            "promotion_target": "skill",
+            "instruction": (
+                "작업이 엔진 타임아웃으로 끊기면 같은 목표로 새 작업을 또 띄우지 말고, 착수 즉시 결과.md에 "
+                "단계 체크리스트를 박아 두고 미통과 단계부터 이어서 재개한다(통과 단계 재생성 금지). "
+                "한 번에 너무 큰 작업은 자원 단위로 쪼개 한 번에 하나씩 체크포인트를 남기며 진행한다"
+                "(large-task-checkpointing)."
+            ),
+            "applies_when": {
+                "keywords": ["타임아웃", "timeout", "체크포인트", "재개", "결과.md", "large-task-checkpointing"],
+            },
+            "evidence_type": "agent_observation",
+            "source_quote": _fail_reason[:240],
+        }
     try:
         lesson_ledger.record_post_task_evaluation(
             space,
@@ -1966,11 +2048,14 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
             task_title=objective[:160],
             result_summary=result[:1000],
             what_worked=["TaskPack v0 adapter completed and enqueued release request for approval"] if outcome == "success" and release_request.get("queue_state") == "enqueued" else [],
-            what_failed=[hold_reason or str(raw_status.get("사유") or state or "unknown work status")] if outcome != "success" else [],
+            what_failed=[_fail_reason] if outcome != "success" else [],
             lesson_candidate_needed=outcome != "success",
+            lesson_candidate=_task_lesson_candidate,
             no_lesson_reason=(
                 "no_failure_or_correction"
                 if outcome == "success"
+                else ""
+                if _task_lesson_candidate
                 else "taskpack_v0_completion_hold_or_failure_requires_review"
             ),
         )

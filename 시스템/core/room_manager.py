@@ -1486,6 +1486,46 @@ def _handle_chat_agent_result(
     if orchestration.effect_exists(space, effect_id):
         return f"작업 요청 중복 감지: {worker}"
 
+    # ── 중복 기동 방지: 같은 worker에 이미 살아있는 작업이 있으면 새로 띄우지 않고 그쪽에 진행을 독촉(steer) ──
+    # 실증 2026-06-29: 대표 "이어서 가봐"가 살아있는 985a(이식 2/4 진행 중)를 둔 채 잉여 62cc를 새로 띄워
+    # ②③④ 중복 생산 임박. 한 worker는 동시에 하나의 작업만 — 다자 동시작업은 '서로 다른 worker'로 한다
+    # (목표.md: 동시작업은 살리되 한 일꾼의 중복 기동은 금지). heartbeat가 죽은(stale) 작업은 막지 않는다
+    # (그건 재개/재실행 대상). request_progress는 기존 작업을 재실행하지 않아 진행 손실이 없다.
+    try:
+        _alive_same_worker = [
+            t for t in (task_registry.snapshot(space).get("active_items") or [])
+            if t.get("worker_agent") == worker
+            and t.get("state") == "running"
+            and not t.get("heartbeat_stale")
+        ]
+    except Exception:
+        _alive_same_worker = []
+    if _alive_same_worker:
+        _busy_id = _alive_same_worker[0].get("task_id", "")
+        try:
+            request_task_steering(
+                space,
+                _busy_id,
+                action="request_progress",
+                instruction=("대표 추가 지시/이어가기: " + str(clean_objective)[:400]),
+                actor=wake,
+                control_context=context,
+            )
+        except Exception:
+            pass
+        _append_activity(space, {
+            "상태": "chat_request_work_steered_existing",
+            "시각": now_iso(),
+            "actor": wake,
+            "target": worker,
+            "label": "기존 작업에 진행 독촉(중복 기동 방지)",
+            "detail": f"worker={worker} 이미 running task={_busy_id} → 새 작업 대신 steer",
+            "task_id": _busy_id,
+            **_context_fields(context),
+            **_claim_fields(claim),
+        })
+        return f"기존 작업 재지시(중복 기동 방지): {worker} task={_busy_id}"
+
     # ── 승인 게이트 (설계_작업계획승인.md) ──────────────────────────────────
     # 곧장 engine.work() 하지 않는다. 먼저 '계획'을 등록하고, 승인 필요 여부로 분기한다.
     plan_steps = request.get("plan") or [clean_objective]
@@ -4906,6 +4946,37 @@ def recover_stalled_spaces() -> list[dict]:
     return results
 
 
+def reflow_all_spaces() -> list[dict]:
+    """모든 공간의 완료·미게시 작업 결과를 방으로 회수·공개한다(설계_대화작업분리 Phase B 백스톱).
+
+    reflow는 본래 (a)대표 메시지(spaces.py post) · (b)작업완료(run_work finally)에만 트리거된다.
+    그런데 작업완료 시점의 reflow는 매니저 claim 경합('manager claim busy')이나 프로세스 하드킬로
+    조용히 실패할 수 있고(실증 2026-06-29: win 이식 완료 후 ~11분 침묵, 대표가 직접 prod해야 공개됨),
+    매니저 tick 경로엔 reflow가 없다. 그래서 그 두 트리거가 모두 빗나가면 완료 결과가 release_queue에
+    pending으로 남아 '대표의 다음 발화'까지 방에 안 뜬다 — 목표(작업 결과가 대화로 돌아온다)의 직접 위반.
+
+    이 함수는 외부 트리거 없이 주기적으로 호출되는 백스톱이다(대시보드 서버의 reflow-backstop 스레드).
+    reflow_safe는 멱등(세대펜스 + published 제외 + already_committed)·예외안전이라, 빈 큐에서는 사실상
+    no-op이고 claim 경합 시엔 다음 주기에 재시도되어 이중공개나 장애를 만들지 않는다.
+    """
+    results = []
+    if not SPACES.exists():
+        return results
+    for space_dir in sorted(SPACES.iterdir()):
+        if not space_dir.is_dir():
+            continue
+        if not (space_dir / MANAGER_DIRNAME).exists():
+            continue
+        try:
+            res = reflow_safe(space_dir.name)
+            if res.get("published"):
+                results.append({"space": space_dir.name, "published": res.get("published")})
+        except Exception:
+            # reflow_safe는 본래 예외를 던지지 않지만, 한 공간 실패가 다른 공간 공개를 막지 않게 이중 방어.
+            pass
+    return results
+
+
 def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict | None = None) -> dict:
     sdir = SPACES / space
     manager = sdir / MANAGER_DIRNAME
@@ -6256,17 +6327,50 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
                 **_claim_fields(claim),
             })
             events.append({"type": "wake_failed", "person": wake, "message": message, "error": err})
-            _safe_record_interaction_evaluation(
-                space,
-                outcome="failed",
-                context=context,
-                source_event="wake_failed",
-                actor="공간관리",
-                target=wake,
-                what_failed=[err],
-                lesson_candidate_needed=True,
-                no_lesson_reason="agent_wake_failure_requires_manual_review_v0",
-            )
+            # 타임아웃류 wake 실패는 자기성장 루프로 케이스화한다(중복기동 방지 교훈 → 스킬 승격 후보).
+            # 그 외 실패(모델/멤버/스키마 등)는 종전대로 수동검토 보류로 둔다 — 회귀 최소화.
+            _err_l = err.lower()
+            _is_timeout_failure = ("타임아웃" in err) or ("timeout" in _err_l) or ("시간 초과" in err)
+            if _is_timeout_failure:
+                _safe_record_interaction_evaluation(
+                    space,
+                    outcome="failed",
+                    context=context,
+                    source_event="wake_failed",
+                    actor="공간관리",
+                    target=wake,
+                    what_failed=[err],
+                    lesson_candidate_needed=True,
+                    # instruction은 안정 문자열 → lesson_id가 내용기반으로 dedup되어 폭증하지 않는다.
+                    lesson_candidate={
+                        "kind": "lesson",
+                        "scope": "space",
+                        "promotion_target": "skill",
+                        "instruction": (
+                            "엔진 타임아웃·턴 전달 실패(wake_failed)가 나면 같은 목표로 새 작업을 또 띄우지 말고, "
+                            "① 같은 worker에 살아있는 기존 작업이 있으면 그 체크포인트(결과.md)를 확인해 재개하고 "
+                            "② 죽었으면 같은 작업폴더에서 미통과 단계부터 재실행한다(통과 단계 재생성 금지). "
+                            "한 worker는 동시에 하나의 작업만 — 중복 기동을 금지한다(large-task-checkpointing)."
+                        ),
+                        "applies_when": {
+                            "keywords": ["타임아웃", "timeout", "wake_failed", "중복 기동", "재개", "체크포인트"],
+                        },
+                        "evidence_type": "agent_observation",
+                        "source_quote": err[:240],
+                    },
+                )
+            else:
+                _safe_record_interaction_evaluation(
+                    space,
+                    outcome="failed",
+                    context=context,
+                    source_event="wake_failed",
+                    actor="공간관리",
+                    target=wake,
+                    what_failed=[err],
+                    lesson_candidate_needed=True,
+                    no_lesson_reason="agent_wake_failure_requires_manual_review_v0",
+                )
             _write_state(space, "idle", last_action="wake_failed", last_target=wake,
                          label="턴 전달 실패", reason=err,
                          context_pack_id=agent_context_pack.get("context_pack_id", ""),

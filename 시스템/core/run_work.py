@@ -55,6 +55,14 @@ def _run(dispatch_file: str) -> int:
             pass
         result = 1
     finally:
+        # 작업이 끝났으면 완료분(pending release)을 곧바로 방으로 회수·공개한다(설계_대화작업분리 Phase B).
+        # 종전엔 reflow가 '대표 턴' 또는 '외부 폴러'에만 의존해, 작업이 끝나도 결과가 방에 늦게/안 올라왔다
+        # (실증 2026-06-29: win 이식 완료 후 ~11분 침묵, 대표가 직접 prod해야 공개됨).
+        # reflow_safe는 예외를 던지지 않고, 세대펜스+중복방지(already_committed)로 stale/이중공개를 막는다.
+        try:
+            room_manager.reflow_safe(space)
+        except Exception:
+            pass
         # 디스패치 파일 정리(멱등 — 없어도 무방)
         try:
             path.unlink()
