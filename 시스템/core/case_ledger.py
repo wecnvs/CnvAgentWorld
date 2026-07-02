@@ -13,13 +13,13 @@ P1 범위 = 읽기 표면만. 케이스 등록/판단(쓰기)은 P2에서 추가
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import filelock
 from .paths import ROOT
 from .transcript import now_iso
 
@@ -77,11 +77,11 @@ def with_resource_lock(sdir: Path, fn):
     lock = _lock_path(sdir)
     lock.touch(exist_ok=True)
     with lock.open("r+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        filelock.lock_exclusive(lock_file)   # 크로스플랫폼(mac/Win) — POSIX는 flock과 동일 동작
         try:
             return fn()
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            filelock.unlock(lock_file)
 
 
 # --------------------------------------------------------------------------- 공용 헬퍼
