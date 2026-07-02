@@ -1908,6 +1908,13 @@ def _release_request(task_pack: dict, result: str, raw_status: dict, state: str)
             "아래는 그때까지의 산출·진행입니다 — 확인 후 재개/재지시해 주세요.\n\n"
         )
         summary_body = (banner + (result or "(산출물 없음 — 작업 초기에 중단됨)"))[:6000]
+    # P4: 객관 검증이 '거짓 성공 의심(suspect)'이면 깨끗한 성공으로 위장하지 않게 배너로 surface(공개는 막지 않음 — D0).
+    if state in {"done", "partial_ready"} and verification.get("status") == "suspect":
+        vbanner = (
+            f"⚠️ [산출물 검증] 완료로 보고됐으나 객관 검증이 근거를 확인하지 못했습니다 — "
+            f"{verification.get('reason', '산출물/실질 결과 없음')}. 실제로 됐는지 확인하거나 재지시해 주세요.\n\n"
+        )
+        summary_body = (vbanner + summary_body)[:6000]
     return {
         "schema": "ReleaseRequest.v1",
         "release_id": _stable_id("rel", task_pack.get("task_id", ""), task_pack.get("task_pack_id", ""), state),
@@ -2011,9 +2018,16 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
             }
             _write_json(work_dir / "상태.json", raw_status)
 
+    # P4 산출물 객관 검증: 작업자 자기보고 verification이 있으면 존중, 없으면 시스템이 결정론 검증을 돌려
+    # 채운다(산출물 실재·주장 일치). 종전엔 not_run으로 비워 '거짓 성공'(산출물 미변경인데 done)이 통과했음.
     verification = raw_status.get("verification") if isinstance(raw_status.get("verification"), dict) else {}
     if not verification:
-        verification = {"status": "not_run", "not_run_reason": "legacy adapter did not receive verification report"}
+        try:
+            from . import output_verify
+            verification = output_verify.verify_output(work_dir, task_pack, result, state)
+        except Exception as exc:
+            verification = {"status": "not_run", "not_run_reason": f"objective verify 실패: {str(exc)[:120]}"}
+        raw_status["verification"] = verification   # _release_request가 같은 검증을 싣도록 전파
     release_request = {}
     release_enqueue = {}
     # error(엔진 타임아웃 등)도 포함 — 완료/부분 산출이 조용히 사라지지 않고 방에 surface되게 한다.

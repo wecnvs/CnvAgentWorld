@@ -4871,7 +4871,10 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertTrue(any(path.endswith("role.md") for path in task_pack["instruction_files"]))
         self.assertEqual(task_pack["lesson_pack"]["lesson_pack_status"], "ok")
         self.assertEqual(work_status["state"], "done")
-        self.assertEqual(work_status["verification"]["status"], "not_run")
+        # P4(2026-07-02): verification은 더 이상 not_run이 아니라 finalize에서 객관 검증된다.
+        # 이 fake는 산출물 없이 결과.md="작업 완료"만 남기므로 '거짓 성공 의심(suspect)'이 정답.
+        self.assertEqual(work_status["verification"]["status"], "suspect")
+        self.assertTrue(work_status["verification"].get("review_recommended"))
         self.assertEqual(release_request["schema"], "ReleaseRequest.v1")
         self.assertEqual(release_request["release_state"], "approval_pending")
         self.assertEqual(release_request["queue_state"], "enqueued")
