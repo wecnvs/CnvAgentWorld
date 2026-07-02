@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from .paths import SPACES
@@ -155,6 +156,22 @@ def _topic_threads(indexed_rows: list[tuple[int, dict]], latest_seq: int) -> lis
     return topics[:MAX_TOPIC_THREADS]
 
 
+# active/dormant_topic_threads 뷰가 유지할 필드 — 소비처 전수 조사 결과
+# (room_manager._prompt_room_status_snapshot 의 _slim_rows 필드 목록, context_pack.turn_handoff_brief 의
+#  topic_lines 가 읽는 필드)의 합집합. recent_items(스레드당 4건 × 700자 미리보기)는 어느 소비처도
+# 안 읽으므로 뷰에서 제외한다 — 전문은 topic_threads 에만 남는다.
+_TOPIC_VIEW_KEYS = (
+    "thread_id", "status", "latest_event_seq", "first_event_seq", "event_gap",
+    "message_count", "user_message_count", "assistant_message_count",
+    "latest_user_request", "latest_assistant_reply",
+    "freshness_clock", "intent_id", "conversation_thread_id",
+)
+
+
+def _topic_view(item: dict) -> dict:
+    return {key: item[key] for key in _TOPIC_VIEW_KEYS if key in item}
+
+
 def _source_ref(row: dict, fallback: int) -> dict:
     return {
         "event_seq": _row_event_seq(row, fallback),
@@ -165,6 +182,94 @@ def _source_ref(row: dict, fallback: int) -> dict:
         "conversation_thread_id": row.get("conversation_thread_id", ""),
         "room_generation": row.get("room_generation"),
     }
+
+
+# ── 자동 누적요약 ─────────────────────────────────────────────────────────────
+# 요약.md 갱신은 원래 사회자 LLM의 update_summary 재량에 100% 의존했는데, 실방(레빗_bcd7)에서
+# 23시간·대화 66건 동안 단 한 번도 호출되지 않아 요약이 빈 채 방치됐다(장기 맥락 소실 → 재질문·모순).
+# projection 재빌드 때마다 결정적(비-LLM) 자동 요약 블록을 요약.md에 유지해 바닥을 깐다.
+# - 대표 지시 이력은 projection 창 밖으로 밀린 것도 이전 블록에서 물려받아 계속 누적한다(event_seq 병합).
+# - 사회자 update_summary가 쓴 수동 요약 본문은 건드리지 않는다(마커 블록만 교체).
+_AUTO_SUMMARY_BEGIN = "<!-- 자동누적요약:시작 (시스템이 관리 — 손으로 고치지 말 것) -->"
+_AUTO_SUMMARY_END = "<!-- 자동누적요약:끝 -->"
+_SUMMARY_PLACEHOLDER = "(아직 요약 없음)"
+MAX_AUTO_SUMMARY_DIRECTIVES = 100
+_AUTO_DIRECTIVE_PREVIEW_CHARS = 200
+_AUTO_DIRECTIVE_LINE_RE = re.compile(r"^- \[#(\d+)\] ")
+
+
+def summary_path(space: str) -> Path:
+    return _space_dir(space) / "요약.md"
+
+
+def _auto_directive_line(item: dict) -> str:
+    seq = _as_int(item.get("event_seq"))
+    speaker = str(item.get("speaker") or "대표").strip()
+    preview = str(item.get("content_preview") or "").replace("\n", " ").strip()
+    return f"- [#{seq}] {speaker}: {preview[:_AUTO_DIRECTIVE_PREVIEW_CHARS]}"
+
+
+def _merge_directive_lines(previous_block: str, projection: dict) -> list[str]:
+    """이전 자동 블록의 지시 라인과 현재 projection 지시를 event_seq 로 병합(중복 제거)."""
+    merged: dict[int, str] = {}
+    for line in previous_block.splitlines():
+        match = _AUTO_DIRECTIVE_LINE_RE.match(line.strip())
+        if match:
+            merged[int(match.group(1))] = line.strip()
+    for item in projection.get("user_directive_items") or []:
+        seq = _as_int(item.get("event_seq"))
+        if seq > 0:
+            merged[seq] = _auto_directive_line(item)
+    ordered = [merged[seq] for seq in sorted(merged, reverse=True)]
+    return ordered[:MAX_AUTO_SUMMARY_DIRECTIVES]
+
+
+def _render_auto_summary_block(projection: dict, previous_block: str) -> str:
+    topics = projection.get("topic_threads") or []
+    topic_lines = []
+    for item in topics[:12]:
+        preview = str(item.get("latest_user_request") or item.get("latest_assistant_reply") or "").replace("\n", " ").strip()
+        topic_lines.append(
+            f"- [{item.get('status', '')}] {item.get('thread_id', '')} @#{_as_int(item.get('latest_event_seq'))}: {preview[:160]}"
+        )
+    directive_lines = _merge_directive_lines(previous_block, projection)
+    parts = [
+        _AUTO_SUMMARY_BEGIN,
+        f"## 자동 누적요약 (기준 event #{_as_int(projection.get('applied_event_seq'))}, {projection.get('updated_at', '')})",
+        "",
+        f"**현재 방향:** {str(projection.get('active_context_summary') or '').strip() or '(없음)'}",
+        "",
+        "### 주제 흐름",
+        *(topic_lines or ["- 없음"]),
+        "",
+        "### 대표 지시 누적 (최신순 — 오래된 지시도 창 밖으로 밀리기 전 여기 보존됨)",
+        *(directive_lines or ["- 없음"]),
+        _AUTO_SUMMARY_END,
+    ]
+    return "\n".join(parts)
+
+
+def refresh_auto_summary(space: str, projection: dict) -> None:
+    path = summary_path(space)
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    except Exception:
+        existing = ""
+    begin = existing.find(_AUTO_SUMMARY_BEGIN)
+    end = existing.find(_AUTO_SUMMARY_END)
+    previous_block = existing[begin:end] if (begin != -1 and end > begin) else ""
+    block = _render_auto_summary_block(projection, previous_block)
+    if begin != -1 and end > begin:
+        new_text = existing[:begin] + block + existing[end + len(_AUTO_SUMMARY_END):]
+    elif _SUMMARY_PLACEHOLDER in existing:
+        new_text = existing.replace(_SUMMARY_PLACEHOLDER, block, 1)
+    else:
+        base = existing.rstrip()
+        new_text = (base + "\n\n" if base else "") + block + "\n"
+    if new_text != existing:
+        tmp = path.with_suffix(".md.tmp")
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(path)
 
 
 def _read_legacy_summary(space: str) -> dict:
@@ -240,8 +345,12 @@ def _build_projection(space: str, rows: list[dict], *, previous: dict | None = N
     ]
     user_directives = _user_directive_items(user_rows)
     topic_threads = _topic_threads(indexed_rows, latest_seq)
-    active_topic_threads = [item for item in topic_threads if item.get("status") == "active"]
-    dormant_topic_threads = [item for item in topic_threads if item.get("status") == "dormant"]
+    # active/dormant 는 topic_threads 의 부분집합이라 전문 복사하면 같은 데이터가 projection 에
+    # 3중 저장된다(실증: 레빗_bcd7 팩당 topic 39KB + dormant 30KB + active 9KB — 팩 폭주 주범).
+    # 소비처(room_manager 프롬프트 스냅샷 _slim_rows, context_pack topic_lines 렌더러)는
+    # recent_items 등 무거운 필드를 전혀 읽지 않으므로, 뷰 필드만 남긴 슬림 사본으로 대체한다.
+    active_topic_threads = [_topic_view(item) for item in topic_threads if item.get("status") == "active"]
+    dormant_topic_threads = [_topic_view(item) for item in topic_threads if item.get("status") == "dormant"]
     latest_user = representative_requests[-1] if representative_requests else {}
     latest_assistant = _message_item(assistant_rows[-1][1], assistant_rows[-1][0]) if assistant_rows else {}
     version = _as_int(previous.get("version")) + 1 if previous.get("schema") == PROJECTION_SCHEMA else 1
@@ -321,6 +430,12 @@ def ensure_projection(space: str) -> dict:
         return snapshot(space, latest_event_seq=latest_seq, projection=existing, read_error="")
     projection = _build_projection(space, rows, previous=existing)
     _write_projection(space, projection)
+    # 새 이벤트로 projection이 실제 재빌드될 때만 자동 누적요약을 갱신한다(위 조기반환 경로는 손대지 않음
+    # — status 폴링마다 파일을 다시 쓰지 않는다). 요약 실패가 wake를 막으면 안 되므로 삼킨다.
+    try:
+        refresh_auto_summary(space, projection)
+    except Exception:
+        pass
     return snapshot(space, latest_event_seq=latest_seq, projection=projection, read_error=error)
 
 

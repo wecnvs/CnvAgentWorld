@@ -2,6 +2,7 @@
 """엔진 실행: 폴더(cwd)를 워크스페이스로 채팅/작업 에이전트를 깨운다."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -464,29 +465,48 @@ def _ack_work_steering(work_dir: Path, events: list[dict], *, phase: str, note: 
         return
     latest = events[-1]
     seq = int(latest.get("steering_seq") or 0)
-    status = _read_json(work_dir / "work_status.json", {})
-    current_seen = int(status.get("last_seen_steering_seq") or 0)
-    status = {
-        **status,
-        "last_seen_steering_seq": max(current_seen, seq),
-        "pending_steering_ack": False,
-        "heartbeat_phase": phase,
-        "heartbeat_note": note[:500],
-        "updated_at": now_iso(),
-    }
-    if seq >= current_seen:
-        status.update({
-            "latest_steering_seq": seq,
-            "latest_steering_action": latest.get("action", ""),
-            "latest_steering_instruction": str(latest.get("instruction") or latest.get("reason") or "")[:1000],
-            "latest_steering_requested_at": latest.get("created_at", ""),
-            "latest_steering_requested_by": latest.get("requested_by", ""),
-            "latest_steering_reason_code": latest.get("reason_code", ""),
-            "latest_steering_dedupe_key": latest.get("dedupe_key", ""),
-        })
-    if "schema" not in status:
-        status["schema"] = "WorkStatus.v1"
-    _write_json(work_dir / "work_status.json", status)
+
+    # flock: 매니저 측 request_steering·워커 heartbeat는 space 락 안에서 work_status.json을 갱신하는데
+    # 여기 ack만 무락 read-modify-write였다 — 겹치면 last_seen_steering_seq/pending_steering_ack 갱신이
+    # 유실돼 revise가 반영됐는데도 steering_unacknowledged로 결과가 갇힐 수 있다. 파일 옆 락으로 직렬화.
+    lock = work_dir / ".work_status.lock"
+
+    def mutate():
+        status = _read_json(work_dir / "work_status.json", {})
+        current_seen = int(status.get("last_seen_steering_seq") or 0)
+        updated = {
+            **status,
+            "last_seen_steering_seq": max(current_seen, seq),
+            "pending_steering_ack": False,
+            "heartbeat_phase": phase,
+            "heartbeat_note": note[:500],
+            "updated_at": now_iso(),
+        }
+        if seq >= current_seen:
+            updated.update({
+                "latest_steering_seq": seq,
+                "latest_steering_action": latest.get("action", ""),
+                "latest_steering_instruction": str(latest.get("instruction") or latest.get("reason") or "")[:1000],
+                "latest_steering_requested_at": latest.get("created_at", ""),
+                "latest_steering_requested_by": latest.get("requested_by", ""),
+                "latest_steering_reason_code": latest.get("reason_code", ""),
+                "latest_steering_dedupe_key": latest.get("dedupe_key", ""),
+            })
+        if "schema" not in updated:
+            updated["schema"] = "WorkStatus.v1"
+        _write_json(work_dir / "work_status.json", updated)
+
+    try:
+        lock.touch(exist_ok=True)
+        with lock.open("r+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                mutate()
+                return
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+    except Exception:
+        mutate()  # 락 실패가 ack 자체를 막으면 안 된다(종전 무락 동작으로 폴백)
 
 
 def work(
@@ -555,10 +575,12 @@ def work(
         "- `runtime_capabilities.json`과 `execution_strategy.json`을 확인하고, 가능한 기능만 사용한다.\n"
         f"- 이 작업의 runner_timeout_sec={work_policy['runner_timeout_sec']}, heartbeat_interval_sec={work_policy['heartbeat_interval_sec']}, "
         f"heartbeat_stale_ms={work_policy['heartbeat_stale_ms']}, progress_report_due_ms={work_policy['progress_report_due_ms']} 정책을 인지한다.\n"
-        "- **작업 분할·체크포인트(중요):** 큰 작업은 한 번에 끝내려 하지 마라. 먼저 `결과.md` 상단에 단계 체크리스트를 적고, "
-        "**한 단계씩 수행하며 그 결과를 `결과.md`에 계속 누적·갱신(체크포인트)**한다. 통과한 단계는 다시 건드리지 않는다. "
-        "시간/예산이 부족해 보이면 무리하게 끝내려 말고 **깨끗한 단계 경계에서 멈추고**, `결과.md`에 '완료한 단계'와 "
-        "'## 다음 단계'를 남겨라. 시간제한으로 중단돼도 진행이 있으면 시스템이 그 체크포인트에서 **이어서 재실행**한다(이미 끝낸 단계 반복 금지).\n"
+        "- **작업 분할·체크포인트(가장 중요 — 클로드코드/코덱스처럼 일하라):** 아무리 큰 작업도 한 호출에 끝내려 하지 마라. 그게 타임아웃의 1순위 원인이다. 순서는 항상 이렇다:\n"
+        "  (1) **깊이 읽기 전에 먼저** `결과.md` 상단에 **단계 TODO 체크리스트**를 박는다(골격 우선 — 첫 호출에서 이것조차 못 쓰고 시간 다 쓰면 안 된다).\n"
+        "  (2) **한 번에 '한 단계'만** 완료하고 즉시 `결과.md`에 결과를 저장(체크)한다. 그다음 단계로.\n"
+        "  (3) **한 단계는 '한 runner 호출 안에 확실히 끝낼 만큼' 작아야 한다.** 여러 산출물을 한 단계에 묶지 마라 — 예: 스킬 9개 이식이면 **'스킬 1개 이식'이 한 단계**다(9개를 한 호출에 X). 파일이 크면 '읽기 → 1개만 변환 → 저장 → 체크'로 더 잘게 쪼갠다. 한 단계가 호출보다 커 보이면 그 단계를 다시 하위 단계로 나눠라.\n"
+        "  (4) 통과한 단계는 다시 건드리지 않는다. 시간이 부족하면 무리하지 말고 **깨끗한 단계 경계에서 멈추고** '## 다음 단계'를 남겨라 — 시스템이 그 체크포인트에서 다음 단계부터 **이어서 재실행**한다(끝낸 단계 반복 금지).\n"
+        "  핵심: **진행을 잘게 쪼개 매 단계 저장하면 절대 통째로 실패하지 않는다.** 한 호출에 1단계라도 완료·저장하면 누적으로 끝까지 간다.\n"
         "- 긴 작업은 주요 단계 사이에 `steering/`과 `취소요청.json`을 확인한다.\n"
         "- `steering/`에 새 파일이 있으면 `steering_seq`, `action`, `instruction`을 반영하고 work_status.json의 `last_seen_steering_seq`를 해당 seq 이상으로 갱신한다.\n"
         "- `request_progress`는 현재 진행/막힌 점/다음 단계/부분 결과를 체크포인트로 남기라는 요청이고, `revise_task`는 반영 전 결과가 자동 공개되지 않는 재지시다. 시스템 runner가 실행 중 revise를 감지하면 이 작업을 새 지시와 함께 재실행할 수 있다.\n"

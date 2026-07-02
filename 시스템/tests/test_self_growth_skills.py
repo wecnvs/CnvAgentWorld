@@ -449,6 +449,17 @@ class SkillSmithTests(unittest.TestCase):
         self.assertEqual(front.get("version"), "1")
         self.assertIsNotNone(C.skill_dir(n))
 
+    def test_skill_detail_reads_description_and_skill_md(self):
+        n = self._name()
+        S.create_skill(name=n, description="대시보드에 보여줄 스킬 설명", body="# 본문\n\n## 절차\n1. 읽는다")
+        detail = S.skill_detail(n)
+        self.assertEqual(detail["name"], n)
+        self.assertEqual(detail["description"], "대시보드에 보여줄 스킬 설명")
+        self.assertEqual(detail["grade"], "추가")
+        self.assertIn("SKILL.md", detail["path"])
+        self.assertIn("# 본문", detail["content"])
+        self.assertIn("frontmatter", detail)
+
     def test_dup_refuse_then_overwrite(self):
         n = self._name()
         S.create_skill(name=n, description="d1")

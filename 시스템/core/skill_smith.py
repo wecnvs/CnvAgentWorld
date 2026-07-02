@@ -66,6 +66,29 @@ def list_skills() -> list[dict]:
     return out
 
 
+def skill_detail(name: str) -> dict:
+    """대시보드/검토용 스킬 상세. SKILL.md 원문과 frontmatter를 함께 반환한다."""
+    name = str(name or "").strip()
+    sdir = case_ledger.skill_dir(name)
+    if not sdir:
+        raise SkillSmithError(f"스킬 없음: {name}")
+    manifest = sdir / "SKILL.md"
+    try:
+        content = manifest.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SkillSmithError(f"SKILL.md 읽기 실패: {type(exc).__name__}") from exc
+    front = discovery.parse_front(manifest)
+    return {
+        "name": front.get("name", sdir.name),
+        "description": front.get("description", ""),
+        "grade": sdir.parent.name,
+        "path": str(manifest.relative_to(ROOT)),
+        "frontmatter": front,
+        "maturity": case_ledger.maturity(sdir),
+        "content": content,
+    }
+
+
 def find_similar_skills(queries, *, exclude: str = "", top: int = 5) -> list[dict]:
     """기존 스킬 중 새 작업과 비슷한 것을 recall 신호로 추린다(어휘 + 문자 n-gram).
 

@@ -24,6 +24,15 @@ _LOCAL_LOCKS: dict[str, threading.RLock] = {}
 _LOCAL_LOCKS_GUARD = threading.Lock()
 TASK_HEARTBEAT_STALE_MS = work_settings.DEFAULT_WORK_SETTINGS["heartbeat_stale_ms"]
 TASK_PROGRESS_REPORT_DUE_MS = work_settings.DEFAULT_WORK_SETTINGS["progress_report_due_ms"]
+# 갓 디스패치된 작업은 서브프로세스 기동·모델 로드로 첫 heartbeat까지 수십 초가 걸린다. 그 사이엔
+# heartbeat_missing→stale로 뜨지만 실제로는 '시작 중=살아있음'이므로, created 이후 이 유예창 안이면
+# startup_grace로 표시해 소비자(예: 자동연속 억제)가 죽은 작업과 구분한다(콜드스타트 race의 '생각 중' 깜빡임 방지).
+TASK_STARTUP_GRACE_MS = 90_000
+# heartbeat가 이 시간(5분)을 넘겨 끊긴 stale 작업 중, 상태.json에 완료/취소 근거가 전혀 없는
+# '무진행 스트랜드'(워커가 done/error도 못 쓴 채 죽거나 락대기로 멈춰 결과가 영영 안 돌아오는 경우)는
+# 조용히 active에 박제하지 않고 error(중단 보고)로 강제 종결해 그때까지의 산출을 방에 surface한다
+# (대표 신고: 작업이 돼도 결과·캡처가 대화로 안 돌아온다 → 결과가 반드시 돌아오게).
+TASK_STRAND_REPORT_GRACE_MS = 5 * 60_000
 TASK_PROGRESS_REPORT_DUE_REASON_CODE = "progress_report_due"
 TASK_RUNTIME_HEARTBEAT_LABELS = {
     "steering_progress_seen": ("progress_seen", "진행보고 요청 확인"),
@@ -44,6 +53,10 @@ RELEASE_FOLLOWUP_EVENTS = {
     "task_release_enqueued",
     "task_release_enqueue_failed",
 }
+# 종결 상태 집합 — 원장 압축·heartbeat early-return 등에서 공용(종전엔 리터럴로 5곳 반복).
+CLOSED_TASK_STATES = {"done", "error", "blocked", "partial_ready", "cancelled"}
+# 원장 압축이 재작성할 가치가 있는 최소 제거량 — 이 미만이면 rewrite 비용이 이득을 압도(테스트·소규모 방 보호).
+COMPACT_MIN_REMOVED_EVENTS = 40
 
 
 def _space_dir(space: str) -> Path:
@@ -132,6 +145,86 @@ def _with_lock(space: str, fn):
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
+# ── 원장 압축 (O(n²) 성장 해소) ──────────────────────────────────────────────
+# 실측(레빗_bcd7, 1일): 원장 1.8MB·이벤트 1,100개 중 96.5%가 '종결된 task의 평범한 heartbeat'.
+# 종결 task엔 새 heartbeat가 구조적으로 안 붙으므로(record_heartbeat가 closed면 early-return)
+# 그 heartbeat들은 다시 읽힐 일도 갱신될 일도 없는 죽은 무게인데, 모든 이벤트 기록·snapshot이
+# 이 무게까지 매번 전량 재파싱했다(heartbeat 10초 주기 × 폴링 1.5초 주기 → 누적 O(n²)).
+# 압축 규칙(소비자 무손실): 종결 task에서 아래만 보존하고 평범한 heartbeat를 제거한다 —
+#   · heartbeat 외 모든 이벤트(created/finalized/steering/cancel/release_*/settings)
+#   · 그 task의 마지막 heartbeat 1개(latest fold·last_heartbeat_at 보존)
+#   · phase가 TASK_RUNTIME_HEARTBEAT_LABELS에 있는 heartbeat(runtime_activity 투영 보존)
+# 제거분은 .archive 파일에 append(전체 이력 보존, 코드가 다시 읽지 않음). event_id 불변 → 멱등.
+
+
+def _archive_path(space: str) -> Path:
+    return _space_dir(space) / "task_registry.jsonl.archive"
+
+
+def _compact_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    latest: dict[str, dict] = {}
+    last_heartbeat_index: dict[str, int] = {}
+    for idx, row in enumerate(rows):
+        task_id = row.get("task_id")
+        if not task_id:
+            continue
+        latest[task_id] = row
+        if row.get("event") == "task_heartbeat":
+            last_heartbeat_index[task_id] = idx
+    closed = {
+        task_id for task_id, row in latest.items()
+        if str(row.get("state") or "") in CLOSED_TASK_STATES
+    }
+    if not closed:
+        return rows, []
+    kept, removed = [], []
+    for idx, row in enumerate(rows):
+        task_id = row.get("task_id")
+        if (
+            task_id in closed
+            and row.get("event") == "task_heartbeat"
+            and idx != last_heartbeat_index.get(task_id)
+            and str(row.get("heartbeat_phase") or "") not in TASK_RUNTIME_HEARTBEAT_LABELS
+        ):
+            removed.append(row)
+            continue
+        kept.append(row)
+    return kept, removed
+
+
+def compact_closed_task_events(space: str) -> dict:
+    """종결 task의 평범한 heartbeat를 원장에서 걷어내 활성 원장을 작게 유지한다(멱등·락 내 원자 교체).
+
+    호출처: finalize_task 말미(종결 직후가 가장 자연스러운 시점) + reap 백스톱(30초 주기, 기존 원장
+    마이그레이션 겸). 제거량이 COMPACT_MIN_REMOVED_EVENTS 미만이면 재작성하지 않는다.
+    """
+    def mutate():
+        path = _registry_path(space)
+        rows, error = _rows_with_error(path)
+        if error:
+            # 파싱 못 한 라인이 있는 원장은 압축하지 않는다 — 원본 라인 유실 방지.
+            return {"ok": False, "error": error, "removed": 0}
+        kept, removed = _compact_rows(rows)
+        if len(removed) < COMPACT_MIN_REMOVED_EVENTS:
+            return {"ok": True, "removed": 0, "skipped": True}
+        with _archive_path(space).open("a", encoding="utf-8") as archive:
+            for row in removed:
+                archive.write(json.dumps(row, ensure_ascii=False) + "\n")
+        tmp = path.with_suffix(".jsonl.compact_tmp")
+        tmp.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in kept),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+        return {"ok": True, "removed": len(removed), "kept": len(kept)}
+
+    try:
+        return _with_lock(space, mutate)
+    except Exception as exc:
+        # 압축 실패가 종결/백스톱을 막으면 안 된다 — 다음 기회에 재시도된다.
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}", "removed": 0}
+
+
 def _stable_id(prefix: str, *parts) -> str:
     payload = json.dumps([prefix, *parts], ensure_ascii=False, sort_keys=True, default=str)
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
@@ -214,10 +307,16 @@ def _heartbeat_status(row: dict, *, now: datetime | None = None) -> dict:
     threshold_ms = _heartbeat_stale_threshold_ms(row)
     missing = active_state and not bool(last_heartbeat_at)
     stale = bool(active_state and (missing or age_ms is None or age_ms > threshold_ms))
+    # 첫 heartbeat 전(missing)이라도 created 이후 유예창 안이면 '시작 중=살아있음'으로 본다.
+    startup_grace = False
+    if active_state and missing:
+        created_age_ms = _heartbeat_age_ms(row.get("created_at", ""), now=now)
+        startup_grace = created_age_ms is not None and created_age_ms <= max(threshold_ms, TASK_STARTUP_GRACE_MS)
     return {
         "heartbeat_age_ms": age_ms,
         "heartbeat_missing": missing,
         "heartbeat_stale": stale,
+        "heartbeat_startup_grace": startup_grace,
         "heartbeat_stale_threshold_ms": threshold_ms,
     }
 
@@ -685,6 +784,84 @@ def execution_strategy(task_id: str, task_pack_id: str, capabilities: dict, obje
     }
 
 
+# ── 컴퓨터유즈(원격/로컬 화면 조작) 작업 판별·인가 ───────────────────────────────
+# 러너는 에이전트를 --dangerously-skip-permissions로 돌려 샌드박스를 하드 강제하지 않는다.
+# 따라서 task_pack의 scope/capabilities는 '선언(권고)'이고 정직한 에이전트는 그 선언을 지킨다.
+# 원격 Revit 경고창 진단처럼 화면 캡처·클릭이 본질인 작업에 보수 기본(network:none·
+# external_side_effects:forbidden·vision:false)을 그대로 주면, 에이전트가 '내 scope 밖'이라
+# 정직하게 BLOCKED로 멈춘다(실측: 레빗_bcd7 작업 329e/240a). 그래서 CU 작업만 scope를 작업
+# 성격에 맞게 '인가'해, 에이전트가 대시보드 /api/cu(로컬호스트·비밀불필요)로 화면을 보고 조작하게 한다.
+# 판별은 '등록된 화면 타깃(app_targets) 지목' + 'CU 동작 마커' 동시충족일 때만 → 오탐/회귀 차단
+# (아니면 None → 기존 보수 scope 그대로).
+_CU_DASHBOARD_BASE = "http://127.0.0.1:8686"
+_CU_ACTION_MARKERS = (
+    "computer-use", "computer use", "컴퓨터유즈", "컴퓨터 유즈",
+    "화면 캡처", "스크린샷", "screenshot", "화면 조작", "gui 조작", "gui조작",
+    "cu-win", "cu-mac", "cu_helper", "cu-helper",
+    "클릭", "타이핑", "경고창", "애드인", "리본", "원격 제어", "원격제어",
+)
+_CU_TOOL_DIRS = ["도구/기본/cu-win", "도구/기본/cu-mac"]
+
+
+def detect_computer_use_target(objective: str) -> str | None:
+    """objective가 (1) 등록된 화면 타깃(app_targets)을 실제로 지목하고 (2) 컴퓨터유즈 동작
+    의도가 있으면 그 타깃명을 돌려준다. 둘 중 하나라도 없으면 None(→ 보수 scope 유지·무회귀).
+    등록 타깃명에 근거하므로 단순 키워드로는 오탐하지 않는다."""
+    text = str(objective or "")
+    low = text.lower()
+    if not any(m in low for m in _CU_ACTION_MARKERS):
+        return None
+    try:
+        from . import app_targets
+        targets = app_targets.list_targets()
+    except Exception:
+        return None
+    # 구체적(긴) 타깃명 우선 매칭. 'local'(서버 자체 화면)은 명시적일 때만.
+    named = sorted((str(t.get("name") or "") for t in targets if t.get("name")), key=len, reverse=True)
+    for name in named:
+        if name and name != "local" and name in text:
+            return name
+    if "서버 컴퓨터" in text or "이 호스트" in text or " local " in f" {low} ":
+        return "local"
+    return None
+
+
+def _computer_use_scope(base_scope: dict, target: str, channel: str) -> dict:
+    """CU 작업용으로 scope를 '인가'한다(이 작업 한정). 러너 하드샌드박스가 아니므로 선언을 바꿔
+    정직한 에이전트가 대시보드 /api/cu로 화면 캡처·입력을 하게 한다. 조작 안전은 charter로 가둔다."""
+    s = dict(base_scope)
+    s["read_paths"] = list(base_scope.get("read_paths", [])) + _CU_TOOL_DIRS + [
+        "스킬/추가/computer-use-win", "스킬/추가/computer-use-mac", "스킬/추가/computer-use-charter",
+    ]
+    s["execute_paths"] = list(_CU_TOOL_DIRS)
+    s["allowed_tools"] = ["dashboard_cu_api", "cu-win", "cu-mac", "bash(cu 도구·curl 한정)"]
+    s["network_policy"] = f"computer_use: 로컬호스트 대시보드 {_CU_DASHBOARD_BASE}/api/cu 만 (target={target})"
+    s["external_side_effects"] = (
+        f"computer_use_allowed: 타깃 '{target}'({channel}) 화면 GUI 조작 허용 — "
+        "computer-use-charter 준수(캡처 없이 클릭 금지), 되돌리기 어려운 변경은 화면 원문 확인·근거기록 후에만"
+    )
+    return s
+
+
+def _computer_use_pack_block(target: str, channel: str, worker: str) -> dict:
+    b = _CU_DASHBOARD_BASE
+    return {
+        "schema": "ComputerUseGrant.v1",
+        "authorized": True,
+        "target": target,
+        "channel": channel,
+        "dashboard_base": b,
+        "how_to": [
+            f"1) 화면 캡처(비밀 불필요·누구나): `curl -s '{b}/api/cu/view/screenshot?target={target}&w=1600&q=80' -o 화면.jpg` → 저장한 화면.jpg를 읽어(비전) 실제 화면·경고 원문을 판독한다.",
+            f"2) 화면/세션 상태 확인: `curl -s '{b}/api/cu/view/status?target={target}'`.",
+            f"3) 입력(클릭/타이핑/키)은 타깃 락 보유자만: 먼저 `curl -s -X POST '{b}/api/cu/acquire' -H 'Content-Type: application/json' -d '{{\"agent_id\":\"{worker}\",\"target\":\"{target}\",\"ttl\":180}}'` 로 락을 잡고, `POST {b}/api/cu/view/input` (body: agent_id,target,action=click|type|key,...) 로 조작, 끝나면 `POST {b}/api/cu/release`.",
+            "4) computer-use-charter 준수: '캡처→포인터이동→재캡처확인→클릭' 루프. 캡처 없이/목표 UI 불확실 시 클릭 금지. 조작 후 화면 변화 없으면 같은 조작 반복 금지(창 비활성·frozen 등 다른 가설로 재판정).",
+            "5) 되돌리기 어려운 변경(애드인 신뢰 승인·설정 영구변경)은 화면 원문·원인 확정 후에만, 근거를 결과.md에 남기고 한 스텝씩 검증한다.",
+            "6) 연결정보/자격증명 등 비밀은 결과·공개경로에 평문 금지(law §7). 화면 캡처 증거도 비밀 미노출 영역만 공개한다.",
+        ],
+    }
+
+
 def create_task(
     space: str,
     *,
@@ -736,6 +913,32 @@ def create_task(
     }
     task_pack_id = _stable_id("taskpack", identity)
     release_request_path = "release_request.json"
+    # 컴퓨터유즈 작업이면 scope를 '인가'로 상향(이 작업 한정). 아니면 보수 기본 그대로(무회귀).
+    cu_target = detect_computer_use_target(objective)
+    cu_channel = ""
+    _base_scope = {
+        "read_paths": [
+            _rel(work_dir),
+            _rel((work_dir / role_path).resolve()),
+            _rel((work_dir / law_path).resolve()),
+            _rel((work_dir / law_work_path).resolve()),
+        ],
+        "write_paths": [_rel(work_dir)],
+        "execute_paths": [],
+        "forbidden_paths": ["공간/*/대화.jsonl", "에이전트/*/공간/*/대화.jsonl"],
+        "allowed_tools": [],
+        "network_policy": "none",
+        "external_side_effects": "forbidden",
+    }
+    if cu_target:
+        try:
+            from . import app_targets
+            cu_channel = str((app_targets.resolve(cu_target) or {}).get("channel") or "")
+        except Exception:
+            cu_channel = ""
+        _scope = _computer_use_scope(_base_scope, cu_target, cu_channel)
+    else:
+        _scope = _base_scope
     pack = {
         "schema": "TaskPack.compat_minimal.v1",
         "task_pack_id": task_pack_id,
@@ -762,20 +965,7 @@ def create_task(
             "runtime_capabilities.json",
             "execution_strategy.json",
         ],
-        "scope": {
-            "read_paths": [
-                _rel(work_dir),
-                _rel((work_dir / role_path).resolve()),
-                _rel((work_dir / law_path).resolve()),
-                _rel((work_dir / law_work_path).resolve()),
-            ],
-            "write_paths": [_rel(work_dir)],
-            "execute_paths": [],
-            "forbidden_paths": ["공간/*/대화.jsonl", "에이전트/*/공간/*/대화.jsonl"],
-            "allowed_tools": [],
-            "network_policy": "none",
-            "external_side_effects": "forbidden",
-        },
+        "scope": _scope,
         "output_contract": {
             "result_path": "결과.md",
             "status_path": "상태.json",
@@ -806,8 +996,20 @@ def create_task(
         "lesson_pack": lesson_pack,
         "discovery_manifest": discovery_manifest,
     }
+    if cu_target:
+        # 에이전트가 '어떻게' 화면을 보고 조작하는지(로컬호스트 /api/cu·charter·락)를 명시한다.
+        pack["computer_use"] = _computer_use_pack_block(cu_target, cu_channel, worker)
     pack["task_pack_checksum"] = _checksum(pack)
     capabilities = runtime_capabilities(runtime_info, work_policy)
+    if cu_target:
+        # CU 작업만 network·vision·shell을 인가(이 작업 한정). 러너가 샌드박스를 하드강제하지 않으므로
+        # 이 선언이 정직한 에이전트에게 '인가'로 읽힌다. 비-CU 작업은 보수 기본 그대로(무회귀).
+        capabilities["supports_network"] = True
+        capabilities["supports_image_inspection"] = True
+        capabilities["supports_shell"] = True
+        capabilities["computer_use_target"] = cu_target
+        capabilities["computer_use_channel"] = cu_channel
+        capabilities["source"] = str(capabilities.get("source", "")) + "+computer_use_elevated"
     strategy = execution_strategy(task_id, task_pack_id, capabilities, objective)
     handoff = {
         "schema": "TaskHandoffPack.compat_minimal.v1",
@@ -1624,6 +1826,14 @@ def _release_request(task_pack: dict, result: str, raw_status: dict, state: str)
         verification = {"status": "not_run", "not_run_reason": "legacy adapter did not receive verification report"}
     reason = str(raw_status.get("사유") or raw_status.get("reason") or "").strip()
     summary_body = result[:6000]
+    if not summary_body.strip():
+        # 결과.md 없이 done/blocked 선언된 작업 — 빈 public_summary는 publish_release의
+        # "publish content required"에 걸려, 승인 후 영구 미공개 고아가 된다(감사 확정 경로).
+        # 조용히 갇히는 대신 '근거 없는 완료 선언' 사실 자체를 방에 배너로 surface해 대표가 판단하게 한다.
+        summary_body = (
+            f"⚠️ 작업자가 상태를 '{state}'로 선언했지만 결과.md에 산출 기록이 없습니다"
+            f"(사유: {reason or '기록 없음'}). 근거 없는 완료 선언일 수 있으니 작업 폴더를 확인하거나 재지시해 주세요."
+        )
     if state == "error":
         # 결과는 완료(결과.md=✅)인데 마지막 엔진 호출만 타임아웃된 경우도 있고, 진짜 중단도 있다.
         # 어느 쪽이든 '자동 보고가 끊겼다'는 사실 + 그때까지 산출을 방에 올려 대표가 판단하게 한다.
@@ -1857,6 +2067,10 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
                 f"{local_pending_steering.get('steering_seq')} not seen by worker "
                 f"(last_seen={local_pending_steering.get('last_seen_steering_seq')})"
             )
+            # law_work.md 정본: 재지시(revise) 반영 전 결과는 공개 대기열에 올라가지 않는다 — enqueue 금지 유지.
+            # 사회자에게는 RoomStatusSnapshot.tasks.pending_steering_count 로 노출되고, 대표 입력의
+            # 응답의무는 sweep(고아 assigned 재개)이 되살린다. 결과 본문을 공개하는 유일한 길은
+            # 워커가 재지시를 실제 반영(ack)한 뒤 다시 finalize 되는 것.
             local_release_request = {
                 **local_release_request,
                 "release_state": "steering_unacknowledged",
@@ -2069,7 +2283,119 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
         "release_enqueue": release_enqueue,
         "lesson_application_hold": bool(hold_reason),
         "lesson_application_error": hold_reason,
+        # 종결 직후가 압축 적기 — 이 task의 heartbeat 무게가 방금 '죽은 무게'가 됐다.
+        # (제거량이 임계 미만이면 no-op — 테스트·소규모 방은 재작성 안 함.)
+        "ledger_compaction": compact_closed_task_events(space),
     }
+
+
+def recent_closed_items(space: str, *, worker: str = "", limit: int = 20) -> list[dict]:
+    """최근 종료된 작업(done/error/blocked/partial_ready/cancelled)을 작업별 최신상태 기준 최신순 반환.
+
+    snapshot()은 active(running/cancel_requested)만 노출한다. 에이전트가 '내가 무엇을 어디까지
+    했는지'(완료 이력·진척)를 자기 wake에서 보게 하려면 종료된 작업도 필요하다 — 그 재료를 여기서
+    제공한다. worker를 주면 그 에이전트가 맡았던 작업만 거른다. 예외안전·limit으로 hot-path를 가둔다.
+    """
+    try:
+        registry, _ = _rows_with_error(_registry_path(space))
+    except Exception:
+        return []
+    latest_by_task = _latest_tasks(registry)
+    closed_states = {"done", "error", "blocked", "partial_ready", "cancelled"}
+    now = datetime.now()
+    rows = [
+        _compact_task(row, now=now)
+        for row in sorted(latest_by_task.values(), key=lambda item: item.get("_row_index", 0))
+        if row.get("state") in closed_states and (not worker or row.get("worker_agent") == worker)
+    ]
+    return rows[::-1][:limit]  # 최신 종료 먼저
+
+
+def reap_stale_tasks(space: str) -> list[dict]:
+    """heartbeat가 끊긴 비종결 작업을 work_dir 상태.json/체크포인트 근거로 강제 finalize한다(자동복구 reaper).
+
+    [메우는 빈틈] 엔진이 '최종 보고/release 턴'에서 타임아웃나거나 워커 프로세스가 하드킬되면, 작업은
+    산출물상 완료(상태.json=done, 결과.md 체크포인트 DONE)인데도 registry엔 running/cancel_requested로
+    남아 active로 '박제'된다. 그러면 (1)사회자가 '작업 중'으로 오인해 다음 작업을 안 띄우고(체인 정지),
+    (2)완료 산출물이 release/배포로 안 흘러간다(실증 2026-06-30 dc1f: 8파일 완료·done인데 registry running
+    → 다음 종 미발행·미배포; 좀비 2a22: 죽은 워커의 cancel_requested 영구 active로 체인 차단).
+    recover_space는 방이 idle이면 no-op이고(박제는 방 idle+작업 running), reflow_all_spaces는 이미
+    enqueue된 release만 발행하므로(박제 작업은 release 자체가 없음) 둘 다 이 케이스를 못 푼다.
+
+    [동작] 신선 heartbeat 작업은 절대 건드리지 않는다(살아 일하는 중일 수 있음 — snapshot의 heartbeat_stale
+    판정만 신뢰). stale 작업에 대해 work_dir 상태.json을 보고:
+      · 상태=done                         → finalize_task(done)  → release→reflow 공개·자동배포
+      · 상태=error + 타임아웃 사유 + 체크포인트 완료 → finalize_task(동일 reconciliation으로 done 화해)
+      · cancel_requested(죽은 워커)         → 상태.json=cancelled 대필 후 finalize_task(cancelled)로 종결
+    그 외(근거 없는 미완 error 등)는 보존한다(미완을 done으로 오승격하지 않게). 예외안전.
+    """
+    results: list[dict] = []
+    try:
+        snap = snapshot(space)
+    except Exception:
+        return results
+    stale = [a for a in (snap.get("active_items") or []) if a.get("heartbeat_stale")]
+    for item in stale:
+        task_id = str(item.get("task_id") or "")
+        worker = str(item.get("worker_agent") or "")
+        rel = str(item.get("work_dir") or "")
+        if not task_id or not rel:
+            continue
+        work_dir = ROOT / rel
+        if not work_dir.exists():
+            continue
+        try:
+            raw_status = _read_json(work_dir / "상태.json", {})
+            state = str(raw_status.get("상태") or raw_status.get("state") or "")
+            reason = str(raw_status.get("사유") or raw_status.get("reason") or "")
+            result_md = (work_dir / "결과.md").read_text(encoding="utf-8") if (work_dir / "결과.md").exists() else ""
+            cancel_req = bool(item.get("cancel_requested")) or state == "cancel_requested" or item.get("state") == "cancel_requested"
+            finalize_as = ""
+            if state == "done":
+                finalize_as = "done"
+            elif state == "error" and _is_timeout_reason(reason) and _checkpoint_reports_done(result_md):
+                finalize_as = "done"  # finalize_task가 동일 reconciliation 수행
+            elif cancel_req:
+                finalize_as = "cancelled"
+            if not finalize_as:
+                # 완료/취소 근거는 없지만 heartbeat가 오래(기본 5분+) 끊긴 '무진행 스트랜드' — 워커가
+                # done/error도 못 쓴 채 죽거나 락대기로 멈춰, 그대로 두면 결과가 영영 대화로 안 돌아온다
+                # (대표 신고). 조용히 active에 박제하지 않고 error(중단 보고)로 종결해 그때까지의 산출
+                # (결과.md·캡처)을 방에 surface한다 — 대표가 진행을 보고 재개/재지시할 수 있게. (finalize_task가
+                # 상태.json=error를 blocked_report 경로로 공개; 완료로 오승격하지 않음.) 살아 heartbeat하는
+                # 작업은 애초에 stale이 아니라 여기 오지 않으므로 라이브 작업을 오종결할 위험은 없다.
+                age_ms = item.get("heartbeat_age_ms")
+                if age_ms is None or age_ms < TASK_STRAND_REPORT_GRACE_MS:
+                    continue  # 잠깐 stale일 수 있음(막 끊김) → 보수적으로 더 기다린다
+                raw_status = {
+                    **raw_status,
+                    "상태": "error",
+                    "사유": (reason + " | " if reason else "")
+                            + "reaper: heartbeat 장기 끊김 무진행 스트랜드 강제 중단 보고(워커 종료/락대기 추정)",
+                }
+                _write_json(work_dir / "상태.json", raw_status)
+                finalize_as = "error"  # finalize_task가 error를 blocked_report로 산출 surface
+            tp_path = work_dir / "task_pack.json"
+            task_pack = _read_json(tp_path, {}) if tp_path.exists() else {}
+            if finalize_as == "cancelled" and state != "cancelled":
+                # 죽은 워커가 못 쓴 종결 상태를 시스템이 대신 기록(finalize_task가 상태.json을 읽으므로)
+                raw_status = {
+                    **raw_status,
+                    "상태": "cancelled",
+                    "사유": (reason + " | " if reason else "") + "reaper: 죽은 워커 취소요청 강제 종결(heartbeat stale)",
+                }
+                _write_json(work_dir / "상태.json", raw_status)
+            res = finalize_task(
+                space, task_id=task_id, worker=worker, work_dir=work_dir,
+                task_pack=task_pack, objective=task_pack.get("objective", ""),
+            )
+            results.append({
+                "space": space, "task_id": task_id, "worker": worker,
+                "reaped_as": (res.get("state") if isinstance(res, dict) else finalize_as),
+            })
+        except Exception as exc:
+            results.append({"space": space, "task_id": task_id, "error": f"{type(exc).__name__}: {str(exc)[:120]}"})
+    return results
 
 
 def snapshot(space: str) -> dict:

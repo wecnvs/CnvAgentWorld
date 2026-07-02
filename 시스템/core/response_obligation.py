@@ -220,6 +220,32 @@ def open_for_message(
     return _with_lock(space, mutate)
 
 
+def _resolve_active_obligation_id(rows: list[dict], context: dict | None) -> str:
+    """source id가 없는 context를 intent/thread로 활성 의무에 매칭한다(최신 우선).
+
+    실증(레빗_bcd7): request_work 위임 경로가 source_message_id/source_event_seq 없는 context로
+    delegate_to_task를 불러 ResponseObligationError로 3회 연속 실패 — 의무가 위임 기록 없이 남았다.
+    id를 못 만들 때 예외로 죽는 대신, 같은 intent(없으면 같은 thread)의 활성 의무를 찾아 그걸 전이한다.
+    """
+    context = context or {}
+    intent = str(context.get("intent_id") or "").strip()
+    thread = str(context.get("conversation_thread_id") or "").strip()
+    if not intent and not thread:
+        return ""
+    candidates = [
+        row for row in _latest_by_obligation(rows).values()
+        if row.get("state") in ACTIVE_STATES
+        and (
+            (intent and row.get("intent_id") == intent)
+            or (not intent and thread and row.get("conversation_thread_id") == thread)
+        )
+    ]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda row: row.get("_row_index", 0))
+    return candidates[-1].get("obligation_id", "")
+
+
 def _transition(
     space: str,
     context: dict | None,
@@ -233,14 +259,22 @@ def _transition(
     if state not in ACTIVE_STATES and state not in TERMINAL_STATES:
         raise ResponseObligationError(f"unsupported obligation state: {state}")
     source = _source_fields_from_context(context)
-    obligation_id = _obligation_id(space, source.get("source_message_id", ""), source.get("source_event_seq"))
+    try:
+        obligation_id = _obligation_id(space, source.get("source_message_id", ""), source.get("source_event_seq"))
+    except ResponseObligationError:
+        obligation_id = ""
+        # source id 없는 폴백 매칭에서는 빈 source 필드로 원본 값을 덮어쓰지 않는다.
+        source = {k: v for k, v in source.items() if v not in (None, "")}
 
     def mutate():
         path = _ledger_path(space)
         rows, error = _rows_with_error(path)
         if error:
             raise ResponseObligationError(error)
-        latest = _latest_by_obligation(rows).get(obligation_id)
+        resolved_id = obligation_id or _resolve_active_obligation_id(rows, context)
+        if not resolved_id:
+            return {"ok": True, "missing": True, "unresolved_context": True, "event": {}}
+        latest = _latest_by_obligation(rows).get(resolved_id)
         if not latest:
             return {"ok": True, "missing": True, "event": {}}
         if latest.get("state") in TERMINAL_STATES:
@@ -248,7 +282,7 @@ def _transition(
         row = {
             **latest,
             "schema": "ResponseObligationEvent.v1",
-            "event_id": _stable_id("obligation_event", obligation_id, event, state, actor, reason, extra),
+            "event_id": _stable_id("obligation_event", resolved_id, event, state, actor, reason, extra),
             "event": event,
             "state": state,
             "transition_actor": actor,
@@ -287,6 +321,30 @@ def assign_for_context(
         assigned_to=assignee,
         wake_id=wake_id,
         turn_handoff_id=turn_handoff_id,
+    )
+
+
+def reopen_for_context(
+    space: str,
+    context: dict | None,
+    *,
+    actor: str = "공간관리",
+    reason: str = "",
+) -> dict:
+    """assigned/delegated로 잡아둔 의무를 다시 'open'으로 되돌린다.
+
+    지목한 응답이 실패(예: wake_failed — 엔진 타임아웃/모델오류로 에이전트 턴이 답을 못 냄)해 아직 답이
+    안 나갔을 때, 의무가 'assigned'로 고아가 되면 미응답 sweep(_open_user_obligations는 state=='open'만
+    재구동)이 못 잡아 대표 메시지가 영영 무응답·무재시도로 스트랜드된다(대표 신고 흐름). open으로 되돌리면
+    같은/다음 체인의 sweep이 재구동해 자가치유한다 — manager_failure가 의무를 open으로 유지하는 것과 대칭.
+    이미 종결된(terminal) 의무는 _transition이 no-op으로 보존한다(이미 답한 걸 되살리지 않음)."""
+    return _transition(
+        space,
+        context,
+        state="open",
+        event="obligation_reopened",
+        actor=actor,
+        reason=reason,
     )
 
 

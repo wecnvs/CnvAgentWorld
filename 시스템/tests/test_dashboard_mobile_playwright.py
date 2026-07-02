@@ -154,6 +154,28 @@ class DashboardMobilePlaywrightTests(unittest.TestCase):
         lesson_ledger.generate_promotion_candidates(space, actor="대표")
         return space
 
+    def _seed_space_with_long_chat(self) -> str:
+        space_name = f"{PREFIX}{uuid4().hex[:6]}"
+        space = spaces_core.create_space(space_name)
+        for idx in range(42):
+            room_manager.post(
+                space,
+                f"모바일 긴 대화 스크롤 회귀 메시지 {idx + 1:02d}\n내용 확인용 본문입니다.",
+                requester="대표" if idx % 2 == 0 else "공간관리",
+                run_manager=False,
+                client_message_id=f"long-chat-{space}-{idx}",
+            )
+        return space
+
+    def _open_space(self, page, space: str):
+        page.goto(f"{self.base_url}/", wait_until="domcontentloaded")
+        expect(page.locator("#status.ok")).to_be_visible(timeout=10000)
+        space_card = page.locator("#spaces-list li", has_text=space.rsplit("_", 1)[0]).first
+        expect(space_card).to_be_visible(timeout=10000)
+        space_card.scroll_into_view_if_needed()
+        space_card.locator(".open-room-btn").click()
+        expect(page.locator("#room-title")).to_have_text(space, timeout=10000)
+
     def test_mobile_room_chat_observer_growth_panel_and_send_button(self):
         space = self._seed_space_with_growth_candidate()
         with sync_playwright() as p:
@@ -185,6 +207,9 @@ class DashboardMobilePlaywrightTests(unittest.TestCase):
             space_card.locator(".open-room-btn").click()
 
             expect(page.locator("#room-title")).to_have_text(space, timeout=10000)
+            # 모바일은 채팅 우선으로 관측패널(observer stack)이 기본 접힘이다(채팅 메시지 영역 확보 — 96px→300px+).
+            # 관측 내용을 확인하려면 '상태 펼치기' 토글로 편다.
+            page.locator("#room-observer-all-toggle").click()
             expect(page.locator("#room-observer-stack")).to_be_visible(timeout=10000)
             # 모바일: 스플릿바는 이제 '높이 조절' 핸들로 노출된다(row-resize) — 적층 영역 높이를 드래그로 조절(mobile-resize.js)
             for splitter in ("agents", "spaces", "chat"):
@@ -271,9 +296,246 @@ class DashboardMobilePlaywrightTests(unittest.TestCase):
             expect(page.locator(".msg.outbox", has_text=send_text)).to_be_visible(timeout=5000)
             expect(page.locator("#room-send")).to_have_text("보내기", timeout=5000)
             after_send_y = page.evaluate("window.scrollY")
-            self.assertGreater(after_send_y, 0)
-            self.assertGreaterEqual(after_send_y + 80, before_send_y)
+            # [모바일 하단→최상단 튐 회귀 가드] 예전엔 전송 후 window.scrollTo(0,0)으로 문서를 top으로
+            # 되돌렸다(position:fixed body 전제의 iOS 완화). 그러나 모바일 body는 position:static;
+            # overflow:auto라 그 리셋이 '실제 페이지'를 최상단으로 순간이동시켜 '맨 아래로 내리면(또는
+            # 보내면) 최상단으로 튄다'가 됐다(대표 신고). 이제 전송 후 blur로 키보드만 닫고 스크롤은
+            # 건드리지 않는다 → 보던 위치(여기선 하단)가 유지되어야 한다. top(0)으로 리셋되면 회귀다.
+            self.assertGreater(after_send_y, 0, "전송 후 페이지가 최상단(0)으로 튐 — 하단→최상단 스크롤 튐 회귀")
+            self.assertGreaterEqual(after_send_y + 24, before_send_y, "전송 후 스크롤 위치가 크게 위로 튐(하단→최상단 튐 회귀)")
             page.screenshot(path=str(ARTIFACTS / "dashboard_mobile_after_send_latest.png"), full_page=True)
+
+            context.close()
+            browser.close()
+            self.assertEqual(page_errors, [])
+
+    def test_webkit_busy_room_stays_responsive(self):
+        # 대표 반복신고 근본원인 회귀 가드: iOS Safari(WebKit)에서 작업중(agent_running 등) 방을 열면
+        # 방 안 작업콘솔 iframe이 메인스레드를 포화시켜 화면이 얼고 터치가 다 먹통이 됐다. Chromium(다른
+        # 테스트)으로는 재현 안 됨 → WebKit로 busy 상태 방을 열고 폴링 몇 사이클 뒤에도 응답(터치/스크롤)
+        # 하는지 확인한다. 프리즈면 evaluate/tap이 타임아웃돼 실패한다.
+        space = self._seed_space_with_long_chat()
+        busy = json.dumps({"상태": "agent_running", "current": "레빗전문가_ceba", "activity": [],
+                           "tasks": {"running_count": 1, "latest_worker": "레빗전문가_ceba"}}, ensure_ascii=False)
+        with sync_playwright() as p:
+            if not getattr(p, "webkit", None):
+                raise unittest.SkipTest("webkit not available")
+            try:
+                browser = p.webkit.launch(headless=True)
+            except Exception as exc:
+                raise unittest.SkipTest(f"webkit launch failed: {exc}") from exc
+            context = browser.new_context(
+                viewport={"width": 390, "height": 844}, has_touch=True, device_scale_factor=2,
+                user_agent=("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
+            )
+            page = context.new_page()
+            page.set_default_timeout(8000)
+            page.route("**/api/spaces/*/status*", lambda r: r.fulfill(status=200, content_type="application/json", body=busy))
+            self._open_space(page, space)
+            page.wait_for_timeout(8000)   # 폴링 ~5사이클(busy 상태 재렌더). 프리즈면 이후 호출이 막힌다.
+            # 메인스레드가 살아있어야 한다(프리즈면 아래 evaluate가 타임아웃 → 테스트 실패)
+            self.assertGreaterEqual(page.evaluate("() => document.querySelectorAll('#room-messages .msg').length"), 1)
+            # 입력 터치가 정상이어야 한다(먹통 아님)
+            inp = page.locator("#room-input").first
+            ib = inp.bounding_box()
+            page.touchscreen.tap(ib["x"] + ib["width"] / 2, ib["y"] + ib["height"] / 2)
+            page.wait_for_timeout(200)
+            self.assertEqual(page.evaluate("() => document.activeElement && document.activeElement.id"),
+                             "room-input", "busy 방에서 입력 터치 먹통(WebKit 프리즈)")
+            context.close()
+            browser.close()
+
+    def test_mobile_combobox_space_switch_renders_and_touch(self):
+        # 대표 신고 회귀 가드: 공간대화 콤보박스로 공간을 선택하면 채팅이 안 그려지고 터치가 먹통.
+        # 전환 후 (1)제목·메시지 렌더 완료, (2)JS 에러 없음, (3)입력 터치 정상, (4)스크롤 동작을 확인한다.
+        space_a = self._seed_space_with_long_chat()          # 42 메시지
+        space_b = self._seed_space_with_growth_candidate()   # 다른 공간(빈/성장후보)
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as exc:
+                raise unittest.SkipTest(f"chromium launch failed: {exc}") from exc
+            context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                is_mobile=True, has_touch=True, device_scale_factor=3,
+                user_agent=(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                ),
+            )
+            page = context.new_page()
+            page_errors: list[str] = []
+            page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+            self._open_space(page, space_a)
+            expect(page.locator("#room-messages .msg")).to_have_count(42, timeout=10000)
+
+            # 콤보박스로 B 전환 → 제목 바뀌고 렌더 완료(에러로 반쯤 그려지다 멈추면 안 됨)
+            page.select_option("#room-space-select", space_b)
+            expect(page.locator("#room-title")).to_have_text(space_b, timeout=10000)
+            expect(page.locator("#room-messages")).to_be_visible()
+
+            # 다시 A로 전환 → 42개 메시지가 모두 렌더돼야 한다(렌더 중단 아님)
+            page.select_option("#room-space-select", space_a)
+            expect(page.locator("#room-title")).to_have_text(space_a, timeout=10000)
+            expect(page.locator("#room-messages .msg")).to_have_count(42, timeout=10000)
+
+            # 전환 직후 입력 터치가 정상(먹통 아님)
+            inp = page.locator("#room-input").first
+            ib = inp.bounding_box()
+            page.touchscreen.tap(ib["x"] + ib["width"] / 2, ib["y"] + ib["height"] / 2)
+            page.wait_for_timeout(200)
+            self.assertEqual(page.evaluate("() => document.activeElement && document.activeElement.id"),
+                             "room-input", "콤보박스 전환 후 입력 터치 먹통")
+
+            # 스크롤 동작
+            page.evaluate("window.scrollTo(0, 300)")
+            page.wait_for_timeout(50)
+            self.assertGreater(page.evaluate("() => window.scrollY"), 0, "전환 후 스크롤 먹통")
+
+            self.assertEqual(page_errors, [], f"콤보박스 전환 중 JS 에러: {page_errors}")
+            context.close()
+            browser.close()
+
+    def test_mobile_split_bar_tap_does_not_freeze_touch(self):
+        # 대표 반복신고 회귀 가드: 모바일에서 공간 진입 후 스플릿바를 탭해도(과거 setPointerCapture로
+        # 터치가 그 바에 갇혀 화면 전체 먹통) 이후 입력창 탭·페이지 스크롤이 정상이어야 한다.
+        # (iOS 특이 프리즈 자체는 headless로 재현 불가하나, capture 누수·입력 미탭·오버레이 등 인접
+        #  회귀 클래스를 가드한다. 정본 규칙: law_manager「모바일 터치·인터랙션 회귀」.)
+        space = self._seed_space_with_long_chat()
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as exc:
+                raise unittest.SkipTest(f"chromium launch failed: {exc}") from exc
+            context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                is_mobile=True, has_touch=True, device_scale_factor=3,
+                user_agent=(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                ),
+            )
+            page = context.new_page()
+            page_errors: list[str] = []
+            page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+            self._open_space(page, space)
+
+            # 스플릿바를 터치로 탭(과거엔 여기서 setPointerCapture로 터치가 갇힘)
+            bar = page.locator('.workspace-splitter[data-splitter-left="chat"]').first
+            expect(bar).to_be_visible()
+            box = bar.bounding_box()
+            page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            page.wait_for_timeout(200)
+
+            # ① 어떤 스플릿바에도 pointer capture가 남아있지 않아야 한다
+            capture_leaked = page.evaluate(
+                """() => [...document.querySelectorAll('.workspace-splitter')].some(
+                     el => [...Array(30)].some((_, i) => { try { return el.hasPointerCapture(i); } catch (_) { return false; } }))"""
+            )
+            self.assertFalse(capture_leaked, "스플릿바에 pointer capture가 남음(터치 먹통 원인)")
+
+            # ② 화면을 덮어 터치를 먹는 전면 오버레이(pointer-events 살아있음)가 없어야 한다
+            blocking_overlay = page.evaluate(
+                """() => { const W = innerWidth, H = innerHeight;
+                     return [...document.querySelectorAll('body *')].some(el => {
+                       const cs = getComputedStyle(el), r = el.getBoundingClientRect();
+                       return (cs.position === 'fixed' || cs.position === 'absolute')
+                         && r.width >= W * 0.9 && r.height >= H * 0.6
+                         && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.pointerEvents !== 'none'
+                         && !el.closest('#roomView'); }); }"""
+            )
+            self.assertFalse(blocking_overlay, "화면을 덮는 터치차단 오버레이가 있음")
+
+            # ③ 바 탭 이후 입력창 터치 탭이 정상 동작해야 한다(먹통 아님)
+            inp = page.locator("#room-input").first
+            ib = inp.bounding_box()
+            page.touchscreen.tap(ib["x"] + ib["width"] / 2, ib["y"] + ib["height"] / 2)
+            page.wait_for_timeout(200)
+            self.assertEqual(page.evaluate("() => document.activeElement && document.activeElement.id"),
+                             "room-input", "바 탭 후 입력창 터치가 먹통(포커스 안 됨)")
+
+            # ④ 페이지 세로 스크롤이 동작해야 한다
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(50)
+            page.evaluate("window.scrollTo(0, 300)")
+            page.wait_for_timeout(50)
+            self.assertGreater(page.evaluate("() => window.scrollY"), 0, "페이지 스크롤이 먹통")
+
+            self.assertEqual(page_errors, [])
+            context.close()
+            browser.close()
+
+    def test_mobile_room_chat_height_and_latest_button(self):
+        space = self._seed_space_with_long_chat()
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as exc:
+                raise unittest.SkipTest(f"chromium launch failed: {exc}") from exc
+            context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                is_mobile=True,
+                has_touch=True,
+                device_scale_factor=3,
+                user_agent=(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                ),
+            )
+            page = context.new_page()
+            page_errors: list[str] = []
+            page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+
+            self._open_space(page, space)
+            expect(page.locator("#room-messages .msg")).to_have_count(42, timeout=10000)
+            expect(page.locator("#room-latest")).to_be_hidden()
+
+            metrics = page.evaluate(
+                """() => {
+                  const chat = document.querySelector('#chat-panel').getBoundingClientRect();
+                  const view = document.querySelector('#roomView').getBoundingClientRect();
+                  const list = document.querySelector('#room-messages');
+                  const messages = list.getBoundingClientRect();
+                  const form = document.querySelector('#room-form').getBoundingClientRect();
+                  return {
+                    innerHeight: window.innerHeight,
+                    chatHeight: chat.height,
+                    viewHeight: view.height,
+                    messageHeight: messages.height,
+                    messageScrollHeight: list.scrollHeight,
+                    messageClientHeight: list.clientHeight,
+                    formBottom: form.bottom,
+                    chatBottom: chat.bottom,
+                    scrollWidth: document.documentElement.scrollWidth,
+                    innerWidth: window.innerWidth
+                  };
+                }"""
+            )
+            self.assertLessEqual(metrics["chatHeight"], metrics["innerHeight"] + 2)
+            self.assertGreater(metrics["messageScrollHeight"], metrics["messageClientHeight"] + 80)
+            self.assertGreater(metrics["messageHeight"], 180)
+            self.assertLessEqual(metrics["formBottom"], metrics["chatBottom"] + 2)
+            self.assertLessEqual(metrics["scrollWidth"], metrics["innerWidth"] + 4)
+
+            page.locator("#room-messages").evaluate(
+                """el => {
+                  el.scrollTop = 0;
+                  el.dispatchEvent(new Event('scroll', { bubbles: true }));
+                }"""
+            )
+            expect(page.locator("#room-latest")).to_be_visible(timeout=3000)
+
+            page.locator("#room-latest").click()
+            page.wait_for_function(
+                """() => {
+                  const el = document.querySelector('#room-messages');
+                  return el && (el.scrollHeight - el.scrollTop - el.clientHeight) <= 8;
+                }""",
+                timeout=3000,
+            )
+            expect(page.locator("#room-latest")).to_be_hidden(timeout=3000)
+            page.screenshot(path=str(ARTIFACTS / "dashboard_mobile_room_latest_button.png"), full_page=True)
 
             context.close()
             browser.close()

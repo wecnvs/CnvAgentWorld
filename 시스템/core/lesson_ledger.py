@@ -347,6 +347,12 @@ GROWTH_GAP_OPEN_STATES = {
     "resource_apply_blocked",
 }
 
+# 이 outcome 들은 punt 사유(no_lesson_reason)가 있어도 '검토 없이 닫으면 안 되는' 주의 결과다.
+# 실증(레빗_bcd7): failed 5·rejected 2·partial 1 전부 "…requires_review" 류 사유 문자열과 함께
+# no_change 로 태어나며 닫혀 성장루프가 공회전했다(94건 중 needs_review 0 — 도달 불가 상태였음).
+# superseded 는 세대펜스가 설계대로 작동한 것(by-design)이라 제외한다.
+GROWTH_REVIEW_OUTCOMES = {"failed", "rejected", "corrected", "partial"}
+
 
 def _growth_gap_id(space: str, evaluation_id: str) -> str:
     return _stable_id("growth_gap", space, evaluation_id)
@@ -396,6 +402,18 @@ def _growth_gap_from_evaluation(space: str, evaluation: dict, lesson_candidate: 
         state = "resource_gap_needs_triage"
         next_action = "decide_skill_or_knowledge_or_no_change"
         reason = "resource_change_needed_without_target_kind"
+    elif (
+        str(evaluation.get("outcome") or "").strip().lower() in GROWTH_REVIEW_OUTCOMES
+        and (not no_lesson_reason or "review" in no_lesson_reason.lower())
+    ):
+        # 종전엔 no_lesson_reason 분기가 먼저라, "…requires_review"라고 스스로 검토를 요구하는
+        # punt 사유조차 no_change 로 태어나며 닫혔다(needs_review 도달 불가 — 성장루프 공회전).
+        # 주의 outcome 에서 사유가 없거나 사유가 검토를 요구하면 열린 상태로 남겨 사회자/승격 경로가
+        # 실제 성장(케이스·레슨·승격후보)으로 잇게 한다. 명시적 종결 사유(already_covered·fence_worked
+        # 등)는 아래 no_change 분기로 정상 종결된다.
+        state = "needs_review"
+        next_action = "record_lesson_or_no_lesson_reason"
+        reason = no_lesson_reason or "attention_outcome_requires_review"
     elif no_lesson_reason:
         state = "no_change"
         next_action = "none"
@@ -1192,6 +1210,56 @@ def record_lesson_application(
         return _append_unique(_applications_path(space), row, "application_id")
 
     return _with_lock(space, mutate)
+
+
+# needs_review gap 이 이 나이(일)를 넘도록 아무 성장으로 이어지지 않으면 자동 종결한다 —
+# 열린 gap 이 무한 적체되면 사회자 프롬프트가 낡은 신호로 오염된다(최근 실패만 살아있게 유지).
+GROWTH_GAP_STALE_DAYS = 7
+
+
+def expire_stale_growth_gaps(space: str, *, max_age_days: int = GROWTH_GAP_STALE_DAYS) -> dict:
+    """오래된 열린 growth gap 을 reviewed_stale_no_change 로 자동 종결한다(멱등·백스톱용)."""
+    from datetime import datetime, timedelta
+
+    def mutate():
+        rows, error = _rows_with_error(_growth_gaps_path(space))
+        if error:
+            return {"ok": False, "error": error, "expired": 0}
+        latest = _latest_by_id(rows, "gap_id")
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        expired = 0
+        for gap in latest.values():
+            if gap.get("state") not in GROWTH_GAP_OPEN_STATES:
+                continue
+            try:
+                created = datetime.fromisoformat(str(gap.get("created_at") or ""))
+            except Exception:
+                continue
+            if created.tzinfo is not None:
+                created = created.replace(tzinfo=None)
+            if created > cutoff:
+                continue
+            _append_unique(
+                _growth_gaps_path(space),
+                _growth_gap_transition(
+                    space,
+                    evaluation_id=str(gap.get("evaluation_id") or ""),
+                    state="reviewed_stale_no_change",
+                    event="growth_gap_expired",
+                    reason=f"{max_age_days}일 초과 미처리 — 자동 종결(최근 실패 신호만 유지)",
+                    promotion_id=str(gap.get("promotion_id") or ""),
+                    target_kind=str(gap.get("target_kind") or "none"),
+                    lesson_ids=gap.get("lesson_ids") or [],
+                ),
+                "gap_event_id",
+            )
+            expired += 1
+        return {"ok": True, "expired": expired}
+
+    try:
+        return _with_lock(space, mutate)
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}", "expired": 0}
 
 
 def generate_promotion_candidates(space: str, *, actor: str = "공간관리", limit: int = 20) -> dict:

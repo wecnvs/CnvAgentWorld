@@ -927,13 +927,13 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertEqual(projection["source"], "event_log_deterministic_v1")
         self.assertEqual(projection["projection_method"]["kind"], "bounded_event_projection_v1")
         self.assertIn("최근 요청을 기준으로 답해줘", projection["active_context_summary"])
-        self.assertTrue(any(item["event_seq"] == first["ack"]["event_seq"] for item in pack["representative_requests"]))
-        self.assertTrue(any(item["event_seq"] == second["ack"]["event_seq"] for item in pack["user_directive_items"]))
-        self.assertTrue(pack["active_topic_threads"])
+        self.assertTrue(any(item["event_seq"] == first["ack"]["event_seq"] for item in projection["representative_requests"]))
+        self.assertTrue(any(item["event_seq"] == second["ack"]["event_seq"] for item in projection["user_directive_items"]))
+        self.assertTrue(projection["active_topic_threads"])
         self.assertIn("precedence_policy", projection)
         self.assertEqual(projection["precedence_policy"]["semantic_conflict_detection"], "not_performed_by_deterministic_projection")
         self.assertFalse(projection["conflict_hints"]["semantic_conflicts_detected"])
-        self.assertTrue(any(ref["message_id"] == second["ack"]["message_id"] for ref in pack["source_refs"]))
+        self.assertTrue(any(ref["message_id"] == second["ack"]["message_id"] for ref in projection["source_refs"]))
         self.assertEqual(space_memory.snapshot(space)["projection_available"], True)
         brief = context_pack.turn_handoff_brief(pack, member, "맥락 확인", "projection v1 검증")
         self.assertIn("대표 지시 누적", brief)
@@ -963,7 +963,7 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertLessEqual(len(projection["user_directive_items"]), space_memory.MAX_USER_DIRECTIVES)
         self.assertEqual(projection["precedence_policy"]["clock"], "event_seq")
         self.assertEqual(projection["conflict_hints"]["candidate_count"], 0)
-        self.assertTrue(any(item["event_seq"] == latest["ack"]["event_seq"] for item in pack["user_directive_items"]))
+        self.assertTrue(any(item["event_seq"] == latest["ack"]["event_seq"] for item in projection["user_directive_items"]))
         prompt_snapshot = room_manager._prompt_room_status_snapshot(space)
         self.assertTrue(prompt_snapshot["space_memory"]["user_directive_items"])
         self.assertTrue(prompt_snapshot["space_memory"]["active_topic_threads"])
@@ -1081,7 +1081,7 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertIn("첫 번째 요청", pack["current_user_request"]["content"])
         self.assertNotIn("두 번째 최신 요청", pack["current_user_request"]["content"])
         self.assertIn("두 번째 최신 요청", pack["active_context_summary"])
-        self.assertTrue(any(item["event_seq"] == second["ack"]["event_seq"] for item in pack["user_directive_items"]))
+        self.assertTrue(any(item["event_seq"] == second["ack"]["event_seq"] for item in pack["space_memory_projection"]["user_directive_items"]))
 
     def test_response_obligation_opens_assigns_and_answers_agent_reply(self):
         space = PREFIX + "obligation"
@@ -1260,6 +1260,158 @@ class OrchestrationV0Tests(unittest.TestCase):
         # 캡(6)까지 가지 않고 새 입력에 양보해 일찍 멈춘다
         self.assertLess(res.get("auto_continue_turns", 0), room_manager.AUTO_CONTINUE_MAX_TURNS)
         self.assertTrue(any(e.get("type") == "manager_auto_continue_yielded" for e in res.get("events", [])))
+
+    def test_launch_app_is_precondition_not_terminal_answer(self):
+        # 회귀(라이브 스트랜드): 대표의 복합요청("revit을 실행해서 거기서 작업하려고 팀을 구성하자")에서
+        # 매니저가 launch_app만 하고 응답의무를 answered로 '조기 종결'해 방이 idle+answered로 스트랜드됐다
+        # (팀 구성·방지침 방치 — idle 방은 어떤 백스톱도 안 잡는다). 수정: launch_app은 '작업의 전제'라
+        # 응답의무를 종결하지 않고, 성공 시 auto-continue로 본 턴을 이어 남은 요청을 처리한다.
+        space = PREFIX + "launchcont"
+        member = PREFIX + "agent_lc01"
+        make_space(space, [member])
+        original_run_engine = room_manager.engine.run_engine
+        fake_app = {"name": "TestApp", "dir": "앱/test/testapp"}
+
+        # A) launch 단독(auto_continue 기본 off)은 응답의무를 answered로 닫지 않는다(조기 종결 금지)
+        def fake_launch_only(cwd, prompt, *args, **kwargs):
+            if Path(cwd).name == MANAGER_DIRNAME:
+                return json.dumps({"action": "launch_app", "app": "TestApp",
+                                   "wake": "", "message": "", "reason": "실행 후 팀 구성"}, ensure_ascii=False)
+            return "ok"
+
+        post_a = room_manager.post(space, "TestApp 실행해서 거기서 작업하게 팀 구성해줘",
+                                   run_manager=False, manager_requested=True, client_message_id="lc-a")
+        with patch.object(room_manager, "_resolve_app", return_value=fake_app), \
+             patch("core.apps.run_app", return_value={"running": True, "pid": 4242}):
+            try:
+                room_manager.engine.run_engine = fake_launch_only
+                res_a = room_manager.tick(space, "이벤트A", post_a["orchestration"])  # auto_continue off
+            finally:
+                room_manager.engine.run_engine = original_run_engine
+        self.assertTrue(any(e.get("type") == "app_launched" and e.get("ok") for e in res_a.get("events", [])))
+        obl_a = response_obligation.snapshot(space)
+        self.assertEqual(obl_a["open_count"], 1)                       # 여전히 열림 → 스트랜드 아님
+        self.assertIsNone(obl_a["state_counts"].get("answered"))       # launch로 answered 금지
+
+        # B) launch 성공은 auto-continue를 켠다. 단순 실행이면 이어진 턴의 stop이 의무를 닫는다(회귀안전)
+        space_b = PREFIX + "launchpure"
+        make_space(space_b, [member + "b"])
+        manager_calls = {"n": 0}
+
+        def fake_launch_then_stop(cwd, prompt, *args, **kwargs):
+            if Path(cwd).name == MANAGER_DIRNAME:
+                manager_calls["n"] += 1
+                if manager_calls["n"] == 1:
+                    return json.dumps({"action": "launch_app", "app": "TestApp",
+                                       "wake": "", "message": "", "reason": "실행"}, ensure_ascii=False)
+                return json.dumps({"action": "stop", "wake": "", "message": "",
+                                   "reason": "실행이 요청의 전부"}, ensure_ascii=False)
+            return "ok"
+
+        post_b = room_manager.post(space_b, "TestApp 켜줘",
+                                   run_manager=False, manager_requested=True, client_message_id="lc-b")
+        with patch.object(room_manager, "_resolve_app", return_value=fake_app), \
+             patch("core.apps.run_app", return_value={"running": True, "pid": 4243}):
+            try:
+                room_manager.engine.run_engine = fake_launch_then_stop
+                res_b = room_manager.tick(space_b, "이벤트B", post_b["orchestration"], auto_continue=True)
+            finally:
+                room_manager.engine.run_engine = original_run_engine
+        self.assertGreaterEqual(res_b.get("auto_continue_turns", 0), 1)  # 실행 후 이어짐
+        self.assertGreaterEqual(manager_calls["n"], 2)                   # 매니저가 한 번 더 판단
+        obl_b = response_obligation.snapshot(space_b)
+        self.assertEqual(obl_b["open_count"], 0)                         # 이어진 stop이 의무를 닫음
+
+    def test_app_detect_running_instances_and_no_duplicate_launch(self):
+        # 회귀(라이브): pidfile만 보던 실행감지가 대시보드 밖에서 켜진 인스턴스를 놓쳐 launch_app이
+        # 중복 Revit을 띄웠고 → localhost:8600 브리지 바인딩 충돌(레빗_bcd7). 수정: 프로세스 시그니처로
+        # target에서 실제 실행 중 인스턴스(+PID)를 감지 → 중복 실행 방지 + PID surface(에이전트 타깃팅).
+        from core import apps as core_apps
+        from unittest.mock import patch
+        rel = "앱/대외비/원격레빗"   # process:Revit, target:desktop-frvh9d8(cu-helper)
+        fake = {"ok": True, "name": "Revit", "procs": [
+            {"pid": 21072, "title": "Autodesk Revit 2026.4 - [프로젝트1]", "start": "2026-06-29T21:50:44"},
+            {"pid": 20752, "title": "", "start": "2026-07-01T11:47:05"}]}
+        # /proclist가 두 인스턴스를 반환한다고 가정(VM 헬퍼 배포 후 상황)
+        with patch.object(core_apps, "_http_json", return_value=fake):
+            det = core_apps.detect_running_instances(rel, fresh=True)
+            self.assertTrue(det["detected"])
+            self.assertEqual([i["pid"] for i in det["instances"]], [21072, 20752])
+            # run_app 중복가드: pidfile 없어도 외부 인스턴스 감지 → 안 띄우고 PID 보고
+            with patch.object(core_apps, "_running_state", return_value={"running": False, "pid": None, "port": None}):
+                res = core_apps.run_app(rel)
+                self.assertTrue(res["already"])
+                self.assertTrue(res["detected_external"])
+                self.assertEqual(res["pid"], 21072)
+                self.assertEqual(res["instance_count"], 2)
+        # 헬퍼 미응답(옛 helper·채널 다운) → graceful: 빈 목록, run_app은 정상 진행 경로(오차단 없음)
+        with patch.object(core_apps, "_http_json", side_effect=Exception("no /proclist")):
+            det2 = core_apps.detect_running_instances(rel, fresh=True)
+            self.assertFalse(det2["detected"])
+            self.assertEqual(det2["instances"], [])
+
+    def test_app_process_signature_launcher_and_webapp_guard(self):
+        # 회귀(라이브): 메모장-맥(run='open -a TextEdit') 종료가 안 됐다. 시그니처를 런처 'open'으로
+        # 잘못 뽑아 pgrep -f가 OpenGL(CVMServer)·opendirectoryd 같은 무관 시스템 프로세스를 오탐 →
+        # 엉뚱한 걸 죽이려다 실패. 또 web-app(python3 http.server)은 시그니처 'python3'로 잡으면
+        # 대시보드 서버 등 무관 python 프로세스를 오종료할 위험 → 웹앱·범용 인터프리터는 감지 제외.
+        from core import apps as core_apps
+        # 1) macOS 런처 open -a X → 실제 앱명(런처 'open' 아님)
+        self.assertEqual(core_apps._process_signature({"run": "open -a TextEdit"}), "TextEdit")
+        self.assertEqual(core_apps._process_signature({"run": "open -a 'Google Chrome'"}), "Google Chrome")
+        self.assertEqual(core_apps._process_signature({"run": "\"C:\\x\\Revit.exe\""}), "Revit")
+        self.assertEqual(core_apps._process_signature({"process": "Foo", "run": "open -a Bar"}), "Foo")  # explicit 우선
+        self.assertIn("python3", core_apps._GENERIC_PROC_SIGNATURES)
+        self.assertIn("open", core_apps._GENERIC_PROC_SIGNATURES)
+        # 2) 웹앱은 프로세스명 감지 제외(빠른메모장=python3 http.server) — 어떤 프로세스 조회도 하지 않음
+        d = core_apps.detect_running_instances("앱/추가/빠른메모장", fresh=True)
+        self.assertFalse(d["detected"])
+        self.assertEqual(d.get("reason"), "web_app_uses_pidfile")
+
+    def test_computer_use_task_gets_elevated_scope_and_caps(self):
+        # 회귀(라이브): 원격 컴퓨터유즈 작업(레빗 mcpbridge 경고창 진단)이 보수 기본 scope
+        # (network:none·external_side_effects:forbidden·vision:false)로 나가, 에이전트가 '내 scope 밖'
+        # 이라 정직하게 BLOCKED로 멈췄다(레빗_bcd7 329e/240a). 러너는 --dangerously-skip-permissions라
+        # 샌드박스를 하드강제하지 않으므로, CU 작업만 scope/능력을 '인가'로 상향하면 에이전트가 대시보드
+        # /api/cu로 실제 화면을 보고 조작할 수 있다. 비-CU 작업은 보수 기본 그대로(무회귀)여야 한다.
+        space = PREFIX + "cutask"
+        worker = PREFIX + "cu_agent01"
+        make_space(space, [worker])
+        seat = PEOPLE / worker / "공간" / space
+        seat.mkdir(parents=True, exist_ok=True)
+        rt = {"engine": "claude", "model": "claude-opus-4-8"}
+
+        # A) 원격 CU 작업(등록 타깃 desktop-frvh9d8 + CU 마커) → 인가 scope + 상향 능력 + how-to 블록
+        cu_dir = seat / "작업" / "cu01"
+        cu = room_manager.task_registry.create_task(
+            space, worker=worker, task_id="cu01",
+            objective="원격 Windows Revit(desktop-frvh9d8)의 mcpbridge 경고창을 화면 캡처해 진단·해소한다",
+            work_dir=cu_dir, runtime_info=rt,
+        )
+        pack = cu["task_pack"]
+        self.assertIn("computer_use", pack["scope"]["network_policy"])
+        self.assertIn("computer_use_allowed", pack["scope"]["external_side_effects"])
+        self.assertTrue(pack["scope"]["execute_paths"])            # cu 도구 경로 인가
+        self.assertIn("computer_use", pack)                        # 에이전트용 how-to
+        self.assertEqual(pack["computer_use"]["target"], "desktop-frvh9d8")
+        caps = json.loads((cu_dir / "runtime_capabilities.json").read_text(encoding="utf-8"))
+        self.assertTrue(caps["supports_network"])
+        self.assertTrue(caps["supports_image_inspection"])
+
+        # B) 일반(비-CU) 작업 → 보수 기본 그대로(무회귀)
+        n_dir = seat / "작업" / "n01"
+        normal = room_manager.task_registry.create_task(
+            space, worker=worker, task_id="n01",
+            objective="철근 배근 스킬 케이스를 정리하고 문서를 갱신한다",
+            work_dir=n_dir, runtime_info=rt,
+        )
+        npack = normal["task_pack"]
+        self.assertEqual(npack["scope"]["network_policy"], "none")
+        self.assertEqual(npack["scope"]["external_side_effects"], "forbidden")
+        self.assertNotIn("computer_use", npack)
+        ncaps = json.loads((n_dir / "runtime_capabilities.json").read_text(encoding="utf-8"))
+        self.assertFalse(ncaps["supports_network"])
+        self.assertFalse(ncaps["supports_image_inspection"])
 
     def test_rapid_inputs_not_dropped_obligation_sweep(self):
         # 회귀(라이브): 빠르게 연속으로 온 대표 메시지 2·3이 누락됐다. 매니저가 첫 입력만 처리하고
@@ -1585,6 +1737,83 @@ class OrchestrationV0Tests(unittest.TestCase):
         for act in ("update_guide", "propose_case", "propose_knowledge", "propose_skill"):
             self.assertTrue(room_manager._should_auto_continue(PREFIX + "nx", {"ok": True, "decision": {"action": act}}), act)
         self.assertFalse(room_manager._should_auto_continue(PREFIX + "nx", {"ok": True, "decision": {"action": "stop"}}))
+
+    def test_auto_continue_keeps_dialogue_with_free_members_during_live_work(self):
+        # 대표 신고 근본수정: 라이브 백그라운드 작업이 있어도 '작업을 안 쥔 자유 멤버'가 있으면
+        # 자동연속으로 다자대화를 잇는다(예전엔 무조건 멈춰 1인 독백). 얘기할 상대가 작업자뿐이면 멈춘다.
+        space = PREFIX + "livework"
+        worker = PREFIX + "lw_worker"
+        reviewer = PREFIX + "lw_reviewer"
+        make_space(space, [worker, reviewer])
+        pass_dec = {"ok": True, "decision": {"action": "pass", "wake": worker}}
+
+        # (1) worker만 live 작업 → 자유 멤버 reviewer가 있으므로 대화를 잇는다
+        snap_worker_busy = {"active_items": [
+            {"worker_agent": worker, "heartbeat_stale": False, "heartbeat_startup_grace": False},
+        ]}
+        with patch.object(room_manager.task_registry, "snapshot", return_value=snap_worker_busy):
+            self.assertEqual(room_manager._live_work_worker_tokens(space), {worker})
+            self.assertEqual(room_manager._free_dialogue_members(space), {reviewer})
+            self.assertTrue(room_manager._has_live_work_task(space))
+            self.assertTrue(room_manager._should_auto_continue(space, pass_dec))
+
+        # (2) 모든 멤버가 작업 중 → 얘기할 상대가 작업자뿐 → 멈춰 완료를 기다린다
+        snap_all_busy = {"active_items": [
+            {"worker_agent": worker, "heartbeat_stale": False},
+            {"worker_agent": reviewer, "heartbeat_stale": False},
+        ]}
+        with patch.object(room_manager.task_registry, "snapshot", return_value=snap_all_busy):
+            self.assertEqual(room_manager._free_dialogue_members(space), set())
+            self.assertFalse(room_manager._should_auto_continue(space, pass_dec))
+
+        # (3) 콜드스타트 grace 작업도 live로 센다(첫 heartbeat 전 stale이어도 작업자로 계수)
+        snap_grace = {"active_items": [
+            {"worker_agent": worker, "heartbeat_stale": True, "heartbeat_startup_grace": True},
+        ]}
+        with patch.object(room_manager.task_registry, "snapshot", return_value=snap_grace):
+            self.assertEqual(room_manager._live_work_worker_tokens(space), {worker})
+            self.assertTrue(room_manager._has_live_work_task(space))
+
+    def test_reap_surfaces_stranded_task_without_completion_evidence(self):
+        # 대표 신고 근본수정: 완료/취소 근거 없이 heartbeat가 오래 끊긴 '무진행 스트랜드'(워커가 done/error도
+        # 못 쓴 채 죽거나 락대기로 멈춤)는 조용히 active에 박제하지 않고 error(중단 보고)로 그때까지의 산출을
+        # release로 surface한다(결과가 반드시 대화로 돌아오게). heartbeat가 아직 잠깐만 끊겼으면 보존한다.
+        space = PREFIX + "strand"
+        member = PREFIX + "agent_str1"
+        make_space(space, [member])
+        work_dir = PEOPLE / member / "공간" / space / "작업" / "strandtask"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "결과.md").write_text("# 진행\n- 벽 1개 그림(캡처 cap09)\n### 검증 (진행 중)", encoding="utf-8")
+        (work_dir / "task_pack.json").write_text(json.dumps({
+            "task_id": "strandtask", "worker_agent": member, "task_pack_id": "tp_strand",
+            "objective": "벽 그리기", "room_generation": 1, "source_event_seq": 1,
+        }, ensure_ascii=False), encoding="utf-8")
+        rel = work_dir.relative_to(task_registry.ROOT).as_posix()
+        base_item = {
+            "task_id": "strandtask", "worker_agent": member, "work_dir": rel,
+            "state": "running", "heartbeat_stale": True, "heartbeat_startup_grace": False,
+            "cancel_requested": False,
+        }
+
+        # (1) heartbeat가 grace(5분)를 넘겨 끊김 + 완료근거 없음 → error 중단보고로 산출 surface
+        (work_dir / "상태.json").write_text(json.dumps({"상태": "running"}, ensure_ascii=False), encoding="utf-8")
+        stranded = dict(base_item, heartbeat_age_ms=task_registry.TASK_STRAND_REPORT_GRACE_MS + 60_000)
+        with patch.object(task_registry, "snapshot", return_value={"active_items": [stranded]}):
+            reaped = task_registry.reap_stale_tasks(space)
+        # 내 분기가 발동: 상태.json이 error(중단 보고)로 재기록되고 finalize가 호출된다.
+        # (error → release surface 링크 자체는 test_engine_work_exception_finalizes_task_as_error가 커버.)
+        st_after = json.loads((work_dir / "상태.json").read_text(encoding="utf-8"))
+        self.assertEqual(st_after["상태"], "error")
+        self.assertIn("스트랜드", st_after.get("사유", ""))
+        self.assertTrue(reaped)
+        self.assertEqual(reaped[0].get("task_id"), "strandtask")
+
+        # (2) 음성 대조: heartbeat_age가 grace 미만이면 아직 회수하지 않는다(막 끊긴 것일 수 있음 — 보존)
+        (work_dir / "상태.json").write_text(json.dumps({"상태": "running"}, ensure_ascii=False), encoding="utf-8")
+        fresh = dict(base_item, heartbeat_age_ms=1000)
+        with patch.object(task_registry, "snapshot", return_value={"active_items": [fresh]}):
+            task_registry.reap_stale_tasks(space)
+        self.assertEqual(json.loads((work_dir / "상태.json").read_text(encoding="utf-8"))["상태"], "running")
 
     def test_normalize_decision_degrades_single_target_parallel_to_pass(self):
         # Gemini 구제: parallel_pass인데 유효 target 1개뿐이면 단일 pass로 강등(실패 대신 1명이라도 진행).
@@ -3949,6 +4178,45 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertEqual(assistant_rows, [])
         self.assertEqual(status["learning"]["evaluation_outcomes"].get("failed"), 1)
         self.assertIsNone(status["learning"]["evaluation_outcomes"].get("success"))
+
+    def test_wake_failed_reopens_obligation_for_resweep(self):
+        # 대표 신고 흐름 근본수정: 지목 에이전트 턴이 실패(wake_failed: 엔진 타임아웃/공개 거부 등)하면
+        # 'assigned'로 잡아둔 응답의무를 'open'으로 되돌려 미응답 sweep이 재구동하게 한다(자가치유).
+        # 안 되돌리면 대표 메시지가 assigned 고아로 남아 영영 무응답·무재시도로 스트랜드된다.
+        space = PREFIX + "wakefailreopen"
+        member = PREFIX + "agent_wf01"
+        make_space(space, [member])
+        # run_manager=False(자동 tick 안 함)로 두되 manager_requested=True로 응답의무는 연다.
+        post = room_manager.post(space, "질문 하나 할게요", run_manager=False, manager_requested=True, client_message_id="c-wf1")
+        context = post["orchestration"]
+        # 의무가 실제로 열렸는지 선확인(전제)
+        self.assertEqual(response_obligation.snapshot(space)["state_counts"].get("open"), 1)
+        original_run_engine = room_manager.engine.run_engine
+        original_append = room_manager.publish_ledger.append_public_message
+
+        def fake_run_engine(cwd, prompt, *args, **kwargs):
+            if Path(cwd).name == MANAGER_DIRNAME:
+                return json.dumps({"action": "pass", "wake": member, "message": "답해줘", "reason": "t"}, ensure_ascii=False)
+            return "reply"
+
+        def reject_publish(*args, **kwargs):
+            raise publish_ledger.PublishLedgerError("simulated engine timeout / publish fail")
+
+        try:
+            room_manager.engine.run_engine = fake_run_engine
+            room_manager.publish_ledger.append_public_message = reject_publish
+            room_manager.tick(space, "test event", context)
+        finally:
+            room_manager.engine.run_engine = original_run_engine
+            room_manager.publish_ledger.append_public_message = original_append
+
+        status = room_manager.status(space)
+        self.assertEqual(status["last_action"], "wake_failed")
+        # 의무가 'assigned' 고아가 아니라 'open'으로 되돌려져 미응답 sweep 재구동 대상이 된다
+        counts = status["response_obligations"]["state_counts"]
+        self.assertEqual(counts.get("open"), 1)
+        self.assertIsNone(counts.get("assigned"))
+        self.assertEqual(len(room_manager._open_user_obligations(space)), 1)
 
     def test_publish_stale_guard_race_records_superseded_not_failed(self):
         space = PREFIX + "publishstalerace"

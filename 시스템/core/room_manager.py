@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
@@ -66,6 +67,8 @@ MANAGER_ACTIONS = {
     "propose_skill",
     "update_guide",
     "propose_knowledge",
+    "update_summary",
+    "launch_app",
     "stop",
 }
 # 자기성장 캡처 액션(대표 durable 피드백을 실제로 저장 — 거짓 기록 금지)
@@ -75,9 +78,12 @@ TASK_CONTROL_ACTIONS = {"cancel_task", "revise_task", "request_progress"}
 # 병렬 후보 join 타임아웃 — '천장'이다(timeout_then_partial은 다 끝나면 wait가 일찍 반환).
 # 동시 콜드스타트(claude -p ×N)는 CPU/IO 경합으로 개수에 비례해 느려지므로 천장을 동시성 비례로 잡는다.
 # (라이브 실증: 고정 20s에선 haiku 3 동시 중 2개가 20s 직전에 잘려 단톡방에 1명만 보였다.)
-PARALLEL_CANDIDATE_JOIN_TIMEOUT_BASE_SECONDS = 30.0
-PARALLEL_CANDIDATE_JOIN_TIMEOUT_PER_TARGET_SECONDS = 12.0
-PARALLEL_CANDIDATE_JOIN_TIMEOUT_MAX_SECONDS = 90.0
+# 2026-06-29 재실증: 대화가 길어지면(맥락 64건+) opus 후보가 54s(2명) 천장을 넘겨 둘 다 잘려 '응답 0개'로
+# 협업이 침묵 실패했다. 각 후보 엔진 타임아웃(300s)과의 괴리가 커서 천장이 응답을 죽인다 — opus·큰 맥락을
+# 견디게 천장을 올린다(상한은 둠). 근본적으론 맥락 요약으로 후보 처리시간을 줄이는 게 더 낫다(후속: 요약 배선).
+PARALLEL_CANDIDATE_JOIN_TIMEOUT_BASE_SECONDS = 60.0
+PARALLEL_CANDIDATE_JOIN_TIMEOUT_PER_TARGET_SECONDS = 30.0
+PARALLEL_CANDIDATE_JOIN_TIMEOUT_MAX_SECONDS = 240.0
 PARALLEL_CANDIDATE_CANCEL_DRAIN_SECONDS = 5.0
 PARALLEL_CANDIDATE_ENGINE_TIMEOUT_SECONDS = 300
 
@@ -95,7 +101,7 @@ MANAGER_DECISION_JSON_CONTRACT = (
     "- JSON 객체 바깥의 글자는 모두 오류이며, 시스템은 재시도한다.\n"
     "- 공개 말풍선으로 대표에게 직접 답하지 말고 action으로만 결정한다.\n"
     "- 최소 형식: "
-    '{"action":"pass|parallel_pass|select_candidate|synthesize_candidates|publish_each|discard_candidate|cancel_task|revise_task|request_progress|propose_case|propose_skill|update_guide|propose_knowledge|stop",'
+    '{"action":"pass|parallel_pass|select_candidate|synthesize_candidates|publish_each|discard_candidate|cancel_task|revise_task|request_progress|propose_case|propose_skill|update_guide|propose_knowledge|update_summary|launch_app|stop",'
     '"wake":"멤버 토큰 또는 빈 문자열","message":"전달/합성/지시 메시지 또는 빈 문자열","reason":"한 줄 이유"}\n'
     "- pass는 wake와 message가 필요하다. stop은 wake와 message를 비운다. "
     "parallel_pass는 targets 배열, 후보 정리는 candidate_id/candidate_ids, 작업 제어는 task_id/task_ids를 함께 넣는다.\n"
@@ -106,6 +112,7 @@ MANAGER_DECISION_JSON_CONTRACT = (
     "- **토론(여러 멤버가 주제로 의견을 주고받게):** 1라운드는 parallel_pass로 각자 의견 → publish_each로 공개. "
     "그 다음 **반응 라운드**를 parallel_pass로 잇는다 — 각 멤버에게 '방금 다른 멤버들이 공개한 의견을 읽고 반박·보강하라'고 시켜 토론을 진전시킨다(1~2회). "
     "토론이 무르익으면 synthesize_candidates로 결론을 정리하거나 stop으로 대표에게 넘긴다. 한 라운드 의견 나열로 끝내지 마라.\n"
+    "- **순차 체인(서로 위에 쌓아야 하는 빡빡한 디베이트·설계):** parallel_pass(동시·서로 못 봄) 대신 pass로 한 명씩 이어 깨운다 — A에게 pass → A 답이 방에 공개되면 시스템이 네 턴을 다시 주니 B에게 pass(B는 방에 보이는 A 답을 읽고 그 위에 이어 말한다) → 필요하면 C… 식. 각자가 직전 발언을 보고 쌓으므로 1라운드 병렬에서 나던 중복(둘이 같은 말)을 없앤다. 대신 병렬보다 느리다. **빠른 독립 의견·가벼운 다자 답이면 parallel_pass, 한 명이 깐 논점을 다음이 받아 더 깊이 파야 하면 순차 체인**으로 골라라. 어느 쪽이든 이어지는 턴 수엔 상한이 있다.\n"
     "- propose_case는 대표 피드백/작업 결과를 읽고 '이 스킬의 경우의 수'로 남길 가치가 있다고 네가 판단했을 때만 쓴다(wake/message 비움). "
     'skill(스킬 이름)과 candidate 객체를 넣는다: {"skill":"스킬이름","candidate":{"condition":"어떤 상황","instruction":"그땐 이렇게","polarity":"worked|failed",'
     '"action":"add_case|supersede","routing_kind":"procedural","judgment_rationale":"왜 이렇게 판단했나","source_quote":"근거 발화 요약(개인/회사 식별정보는 일반화)","sensitivity":"public|confidential"}}. '
@@ -114,12 +121,16 @@ MANAGER_DECISION_JSON_CONTRACT = (
     "- **자기성장 라우팅 — 대표가 durable 피드백을 줬을 때 반드시 실제로 저장한다. '기록했다'고 말만 하지 마라:**\n"
     "  · **durable 피드백은 명시 마커('기억해/다음부터/항상/규칙으로')에 한정되지 않는다.** 작업 방식·산출물을 두고 하는 **규정형/교정형 발화**도 durable이다 — '이래야 돼', '저렇게 해야지', '그게 아니라 이렇게', '~하는 게 맞지', '다시 제대로 해', '왜 ~ 안 했어' 처럼 *어떻게 했어야 했는지를 규정*하면 모두 포함된다. 막연한 '좋다/싫다'·단발 잡담만 durable이 아니다.\n"
     "  · **스킬-우선 원칙 (가장 중요 — 어기면 같은 실수가 반복된다):** 방금 **스킬을 써서 한 작업**의 결과를 대표가 교정하면, 그 교정은 *그 스킬이 틀렸다/부족하다*는 신호다. **먼저 그 스킬을 고친 뒤(propose_case)** 고친 스킬로 다시 하게 한다. 스킬을 안 고치고 곧장 pass로 '다시 해'만 시키지 마라 — 그러면 스킬은 그대로라 다음에도 똑같이 틀린다. (저장하면 시스템이 자동으로 그 스킬로 재작업을 이어준다.)\n"
+    "  · **성공·토론의 worked 교훈도 케이스로 잡는다(실패·교정만이 아니다 — 이게 자주 새는 곳):** 방금 **작업이 성공**했거나 멤버들이 **토론**하며, *다음에·다른 방에서 그 스킬을 더 잘 쓰게 해줄 비자명한 재사용 교훈*(새 기법·우회·함정 회피·더 안전·빠른 방법)이 나오면 — 실패가 아니어도 그 스킬에 propose_case(polarity=worked)로 남긴다. 예: '원격 GUI에서 확인 버튼을 절대좌표로 찍으면 해상도·언어팩 바뀔 때 깨지니, 캡처로 버튼을 찾아 동적 좌표로 클릭한다'(computer-use 류 스킬). **자명·일상적 성공('그냥 됨')은 케이스화하지 마라** — 다음에 분명히 도움 될 비자명 교훈만. 성공이 케이스 0으로 그냥 흘러가면 같은 시행착오를 다음 사람이 또 겪는다.\n"
     "  · **방을 가리지 않는 일반 절차 교훈**('이 스킬을 이렇게 써라', '이런 요청엔 이렇게 응답·산출하라') → propose_case (스킬 케이스, scope=global → 다른 단톡방에도 전파). **마땅한 스킬이 없으면** propose_skill로 새 스킬을 만들고 그 첫 케이스로 담는다(skill=새 이름, description=발견용 설명, candidate=첫 케이스).\n"
     "  · **오직 이 방에만 한정된** 행동·말투·취향('이 방에선 존댓말로', '환영카드는 파란톤') → update_guide (이 방에만 남는다 — 다른 단톡방엔 전파 안 됨)\n"
     "  · **재사용될 사실·기준**('우리 회사 ~', '배포는 금요일 금지') → propose_knowledge (message=사실 한 줄, knowledge=지식 주제 이름, description=발견용 설명 — 전역 지식 자원으로 졸업돼 발견기가 찾아 참고함)\n"
     "  · **①/② 오분류 주의(전파 여부가 갈린다):** 한 방에서 나온 말이라도 방 무관 일반 규칙이면 update_guide가 아니라 propose_case다. 예: 'html/md로 만들어 달라면 말풍선 미리보기로 보여줘'는 propose_case(미리보기 스킬). update_guide로 보내면 그 방에만 갇혀 다른 단톡방엔 적용되지 않는다.\n"
     "  · **pass vs propose_case 판단:** 교정 없이 '계속/다음 단계' 같은 단순 진행이면 pass. 산출물·방식을 *고쳐 달라*는 신호가 조금이라도 있으면 pass가 아니라 propose_case(없으면 propose_skill)부터다. 헷갈리면 스킬을 고치는 쪽으로 기울여라(놓친 학습 > 잉여 케이스).\n"
     "  · 위 라우팅으로 **실제 저장**한 뒤에만 대표 피드백을 처리 완료로 본다. 저장 없이 '기억했다'는 거짓 완료다.\n"
+    "- **앱 실행(launch_app):** 대표가 **'우리 앱(앱 탭에 등록된 앱) 중 X 실행해줘'**(예: revit 실행)라고 하면 launch_app으로 시스템이 그 앱을 **등록된 실행경로(run_app)** 로 띄운다 — app 필드에 앱 이름이나 앱 폴더경로를 넣는다(예: app=\"Revit\" 또는 \"앱/대외비/원격레빗\"). 시스템이 그 앱의 target(원격 윈도우=cu-helper 등)에서 매니페스트 run을 실행하고 pidfile을 기록해 **대시보드 앱 탭에 '● 실행 중'으로 뜬다**(에이전트가 raw 컴퓨터유즈로 더듬는 것과 다르다 — 그건 대시보드가 모른다). 등록 안 된 임의 프로그램은 못 띄운다(앱 탭 등록 앱만). **단순 실행**이면 launch_app으로 끝. **실행 후 그 앱 화면을 조작(예: revit에서 새 프로젝트 만들기)까지** 해야 하면, launch_app으로 띄운 **뒤** pass로 담당 에이전트에게 넘겨 computer-use로 조작하게 한다. wake는 비운다.\n"
+    "- **롤링 누적요약(update_summary):** 대화가 길어지면 오래된 맥락은 최근 창(topic_threads·recent) 밖으로 밀려 사라진다. 그 전에 update_summary로 `요약.md`를 갱신해 **누적 맥락을 압축 보존**한다. message에 **요약.md 전체를 대체할 갱신된 누적요약**을 넣는다 — 기존 요약(space_summary_excerpt)을 버리지 말고 **그 위에 최근 진행을 합쳐 다시 정리**한다(목표·합의된 결정·진행상태·미해결 이슈 중심, 시간순 핵심). 자잘한 잡담은 빼고 '이 방이 지금까지 무엇을 향해 어디까지 왔나'가 한눈에 보이게. wake는 비운다. 이건 방에 공개되는 말풍선이 아니라 내부 누적기록이며, 답할 대표 발언이 따로 있으면 요약을 갱신한 뒤 그 턴을 이어서 처리한다. 새 멤버가 합류했거나 토론·작업이 한 매듭 지어졌을 때가 갱신 적기다.\n"
+    "- **실패에서 배우기(learning.growth_gap_open_items):** RoomStatusSnapshot의 learning 블록에 state=needs_review 인 열린 gap이 보이면, 그건 최근 **실패/반려/교정이 아직 아무 성장으로도 이어지지 않았다**는 신호다. 같은 유형이 반복될 실패면(스킬 오용·절차 누락 등) **propose_case로 케이스화**하고(방 무관 일반 교훈이면 그대로 전파됨), 재사용 사실이면 propose_knowledge로 남긴다. 일회성 환경 문제(일시 타임아웃 등)라 케이스화가 무의미하면 그냥 두라 — 오래된 gap은 시스템이 자동 정리한다. 단 **같은 gap이 여러 번 보이는데 계속 방치하지 마라** — 그게 성장루프 공회전이다.\n"
 )
 
 
@@ -951,20 +962,35 @@ def _run_agent_candidate(
     context_pack.record_pack_delivery(
         space,
         recipient=wake,
-        delivery_type="parallel_candidate_wake",
+        delivery_type="chat_turn_wake" if join_policy == "single_pass" else "parallel_candidate_wake",
         context_pack=agent_context_pack,
         turn_handoff_pack=turn_handoff_pack,
         manager_claim_context=claim,
     )
+    if join_policy == "single_pass":
+        # detached 단일 pass — 병렬 수집이 아니라 매니저가 이 멤버 한 명에게 시킨 일반 채팅 턴이다.
+        # '독립 초안' 문구는 오해(동료 발언 무시)를 부르므로 단일 턴 규칙으로 바꾼다.
+        rules_block = (
+            "\n\n# 응답 처리 규칙(백그라운드 턴)\n\n"
+            "- 네 답은 시스템이 곧바로 네 말풍선으로 방에 공개한다 — 평소처럼 대화 맥락에 이어 답하라.\n"
+            "- **매니저 메시지가 '조사/제작/실행' 같은 실제 작업을 맡긴 것이면**: 이 채팅 턴에서 직접 수행하지 말고 "
+            "ChatAgentResult.v1 JSON으로 `action=\"request_work\"`와 `work_request.objective`를 반환한다 "
+            "— 시스템이 너를 작업자로 **비동기 작업**을 띄운다. `public_reply`에 착수 한마디를 남겨 협업이 보이게 한다.\n"
+            "- 직접 작업 폴더를 만들거나 결과를 방에 직접 공개하지 않는다(공개는 시스템이 한다).\n"
+        )
+    else:
+        rules_block = (
+            "\n\n# 병렬 후보 응답 규칙\n\n"
+            "- 다른 후보의 내용을 보지 못한 독립 초안으로 답한다(동시 수집).\n"
+            "- **매니저 메시지가 '조사/제작/실행' 같은 실제 작업을 맡긴 것이면**: 이 채팅 턴에서 직접 수행하지 말고 "
+            "ChatAgentResult.v1 JSON으로 `action=\"request_work\"`와 `work_request.objective`(무엇을 조사·산출할지 구체적으로)를 반환한다 "
+            "— 시스템이 너를 작업자로 **비동기 작업**을 띄운다. `public_reply`에는 무엇을 맡아 착수하는지 한 줄로 남겨 토론에도 보이게 한다.\n"
+            "- **매니저가 '의견/관점'을 물은 것이면**: 작업을 만들지 말고 텍스트 의견(public_reply)으로 답한다.\n"
+            "- 직접 작업 폴더를 만들거나 결과를 방에 직접 공개하지 않는다(공개는 사회자가 한다).\n"
+        )
     handoff_prompt = (
         context_pack.render_turn_handoff_prompt(agent_context_pack, turn_handoff_pack)
-        + "\n\n# 병렬 후보 응답 규칙\n\n"
-        "- 다른 후보의 내용을 보지 못한 독립 초안으로 답한다(동시 수집).\n"
-        "- **매니저 메시지가 '조사/제작/실행' 같은 실제 작업을 맡긴 것이면**: 이 채팅 턴에서 직접 수행하지 말고 "
-        "ChatAgentResult.v1 JSON으로 `action=\"request_work\"`와 `work_request.objective`(무엇을 조사·산출할지 구체적으로)를 반환한다 "
-        "— 시스템이 너를 작업자로 **비동기 작업**을 띄운다. `public_reply`에는 무엇을 맡아 착수하는지 한 줄로 남겨 토론에도 보이게 한다.\n"
-        "- **매니저가 '의견/관점'을 물은 것이면**: 작업을 만들지 말고 텍스트 의견(public_reply)으로 답한다.\n"
-        "- 직접 작업 폴더를 만들거나 결과를 방에 직접 공개하지 않는다(공개는 사회자가 한다).\n"
+        + rules_block
     )
     cancel_event = cancel_event or threading.Event()
 
@@ -1119,51 +1145,80 @@ def _write_approval_required(space: str, data: dict) -> None:
         pass
 
 
+def _with_approval_marker_lock(space: str, fn):
+    """approval_required.json 의 read-modify-write 직렬화(flock).
+
+    종전엔 락이 없어 백그라운드 tick 의 _mark 와 대시보드 approve 스레드의 _clear 가 겹치면
+    한쪽 갱신이 유실됐다(_atomic_write_json 은 파일 손상만 막지 lost update 는 못 막는다) —
+    결재 마커가 남아 이미 승인한 결재 말풍선이 계속 강조되거나, 새 결재가 마커에서 사라졌다.
+    """
+    lock = SPACES / space / ".approval_required.lock"
+    try:
+        lock.touch(exist_ok=True)
+        with lock.open("r+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                return fn()
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+    except Exception:
+        return fn()  # 락 실패가 마커 갱신 자체를 막으면 안 된다(종전 무락 동작으로 폴백)
+
+
 def _mark_approval_required(space: str, plan: dict) -> None:
     """대표 결재가 필요한 계획을 마커에 추가한다(대시보드가 결재 말풍선 강조·버튼 렌더).
 
     highlight_message_id는 결재 말풍선 발행 후 set_plan_approval_message로 채워진다(P5).
     """
-    data = _read_approval_required(space)
-    pending = [p for p in (data.get("pending") or []) if p.get("plan_id") != plan.get("plan_id")]
-    pending.append({
-        "plan_id": plan.get("plan_id", ""),
-        "worker": plan.get("worker", ""),
-        "requesting_agent": plan.get("requesting_agent", ""),
-        "objective": str(plan.get("objective", ""))[:240],
-        "approval_reason": plan.get("approval_reason", ""),
-        "highlight_message_id": plan.get("approval_message_id", ""),
-        "intent_id": plan.get("intent_id", ""),
-        "room_generation": plan.get("room_generation"),
-        "at": now_iso(),
-    })
-    _write_approval_required(space, {
-        "schema": "ApprovalRequired.v1",
-        "needs_representative": bool(pending),
-        "pending": pending[-50:],
-    })
+    def mutate():
+        data = _read_approval_required(space)
+        pending = [p for p in (data.get("pending") or []) if p.get("plan_id") != plan.get("plan_id")]
+        pending.append({
+            "plan_id": plan.get("plan_id", ""),
+            "worker": plan.get("worker", ""),
+            "requesting_agent": plan.get("requesting_agent", ""),
+            "objective": str(plan.get("objective", ""))[:240],
+            "approval_reason": plan.get("approval_reason", ""),
+            "highlight_message_id": plan.get("approval_message_id", ""),
+            "intent_id": plan.get("intent_id", ""),
+            "room_generation": plan.get("room_generation"),
+            "at": now_iso(),
+        })
+        _write_approval_required(space, {
+            "schema": "ApprovalRequired.v1",
+            "needs_representative": bool(pending),
+            "pending": pending[-50:],
+        })
+
+    _with_approval_marker_lock(space, mutate)
 
 
 def _clear_approval_required(space: str, plan_id: str) -> None:
-    data = _read_approval_required(space)
-    pending = [p for p in (data.get("pending") or []) if p.get("plan_id") != plan_id]
-    _write_approval_required(space, {
-        "schema": "ApprovalRequired.v1",
-        "needs_representative": bool(pending),
-        "pending": pending,
-    })
+    def mutate():
+        data = _read_approval_required(space)
+        pending = [p for p in (data.get("pending") or []) if p.get("plan_id") != plan_id]
+        _write_approval_required(space, {
+            "schema": "ApprovalRequired.v1",
+            "needs_representative": bool(pending),
+            "pending": pending,
+        })
+
+    _with_approval_marker_lock(space, mutate)
 
 
 def _update_approval_marker_message(space: str, plan_id: str, message_id: str) -> None:
     """결재 마커의 highlight_message_id를 결재 말풍선 message_id로 채운다(대화창 버튼 anchor)."""
-    data = _read_approval_required(space)
-    changed = False
-    for entry in data.get("pending") or []:
-        if entry.get("plan_id") == plan_id and entry.get("highlight_message_id") != message_id:
-            entry["highlight_message_id"] = message_id
-            changed = True
-    if changed:
-        _write_approval_required(space, data)
+    def mutate():
+        data = _read_approval_required(space)
+        changed = False
+        for entry in data.get("pending") or []:
+            if entry.get("plan_id") == plan_id and entry.get("highlight_message_id") != message_id:
+                entry["highlight_message_id"] = message_id
+                changed = True
+        if changed:
+            _write_approval_required(space, data)
+
+    _with_approval_marker_lock(space, mutate)
 
 
 def read_approval_required(space: str) -> dict:
@@ -1174,6 +1229,281 @@ def read_approval_required(space: str) -> dict:
 # 작업 디스패치 정책 (설계_대화작업분리 Phase A/E)
 WORK_DISPATCH_ASYNC = True          # 킬스위치: False면 항상 인라인 동기(구 동작)
 MAX_IN_FLIGHT_TASKS = 3             # 방별 동시 실행 작업 상한(폭주·비용 억제, 9.2)
+
+# ── 채팅 턴 디스패치 정책 (설계_대화작업분리 §9.3 갭1 해소 — 티키타카 비동기화) ──
+# 종전엔 단일 pass 채팅 턴이 manager claim을 쥔 채 engine.run_engine(≥300s)을 동기 실행해,
+# 에이전트가 '생각 중'인 동안 대표의 새 메시지가 claim_busy로 튕겨 티키타카가 구조적으로 막혔다
+# (실측 manager_redrive_required 16회/일). 이제 pass 턴을 detached 프로세스(core.run_chat_turn)로
+# 던지고 claim을 즉시 놓는다. 응답은 후보 큐(pending_synthesis)로 회수돼 publish_ready_chat_candidates
+# 가 결정적으로(LLM 없이) 공개한다 — 발행은 여전히 '유효 claim 보유자'가 하므로 발행 원장 단일소유·
+# 세대 펜스 불변식이 그대로 유지된다(옛 턴 내용을 새 claim으로 발행하는 것은 후보 경로가 이미 증명).
+CHAT_DISPATCH_ASYNC = True          # 킬스위치: False면 항상 인라인 동기(구 동작)
+CHAT_TURN_ID_PREFIX = "chatturn"    # 후보 큐에서 '단일 pass 채팅 턴' 후보를 식별하는 turn_id 접두사
+CHAT_CHAIN_MAX_DEPTH = 8            # detached 연속(턴 완료→tick→pass→…) 하드캡. 초과 시 인라인(기존 체인 상한으로 수렴)
+CHAT_DISPATCH_STALE_SEC = 15 * 60   # 디스패치 파일이 이 나이를 넘으면 자식 사망으로 보고 정리(엔진 상한 300s의 3배)
+
+
+def _chat_dispatch_dir(space: str) -> Path:
+    return SPACES / space / "dispatch_chat"
+
+
+def _chat_turn_in_flight(space: str, wake: str) -> bool:
+    """같은 멤버의 detached 채팅 턴이 이미 도는 중인지(중복 wake 방지)."""
+    ddir = _chat_dispatch_dir(space)
+    if not ddir.is_dir():
+        return False
+    for dfile in ddir.glob("*.json"):
+        try:
+            if time.time() - dfile.stat().st_mtime > CHAT_DISPATCH_STALE_SEC:
+                continue
+            if (_load_json(dfile, {}) or {}).get("wake") == wake:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _dispatch_chat_turn(space: str, *, wake: str, message: str, context: dict | None, reason: str) -> bool:
+    """단일 pass 채팅 턴을 detached 프로세스로 디스패치한다. False면 호출자가 인라인으로 폴백.
+
+    _dispatch_work_plan과 같은 패턴: 킬스위치·엔진 몽키패치(테스트)·기록/Popen 실패 시 인라인 폴백이라
+    기존 동기-가정 테스트가 무수정으로 유지된다. 성공 시 claim은 이번 tick 끝에서 곧바로 풀리고,
+    응답 공개·대화 연속은 자식(run_chat_turn)이 publish_ready_chat_candidates + tick으로 잇는다.
+    """
+    if not CHAT_DISPATCH_ASYNC:
+        return False
+    if engine.run_engine is not getattr(engine, "_ORIGINAL_RUN_ENGINE", None):
+        return False  # 테스트 몽키패치 → 인라인(결정성 유지)
+    context = context or {}
+    depth = _as_int(context.get("chat_chain_depth"))
+    if depth >= CHAT_CHAIN_MAX_DEPTH:
+        return False  # detached 연속 하드캡 초과 → 인라인 체인(기존 AUTO_CONTINUE 상한)으로 수렴
+    if _chat_turn_in_flight(space, wake):
+        _append_activity(space, {
+            "상태": "chat_turn_duplicate_skipped", "시각": now_iso(), "actor": "공간관리", "target": wake,
+            "label": "이미 생각 중 — 중복 채팅 턴 생략",
+            "detail": f"{wake}의 detached 채팅 턴이 진행 중이라 새로 띄우지 않음",
+            **_context_fields(context),
+        })
+        return True  # 이미 도는 턴이 답을 가져온다 — 중복 기동하지 않음
+    turn_id = f"{CHAT_TURN_ID_PREFIX}_{uuid4().hex[:12]}"
+    ddir = _chat_dispatch_dir(space)
+    try:
+        ddir.mkdir(parents=True, exist_ok=True)
+        dfile = ddir / f"{turn_id}.json"
+        _atomic_write_json(dfile, {
+            "schema": "ChatTurnDispatch.v1",
+            "space": space, "wake": wake, "message": message,
+            "reason": reason, "context": {**context, "chat_chain_depth": depth},
+            "turn_id": turn_id, "at": now_iso(),
+        })
+    except Exception:
+        return False  # durable 기록 실패 → 인라인 폴백(턴 유실 방지)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SYS) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "core.run_chat_turn", str(dfile)],
+            cwd=str(SYS), start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
+    except Exception:
+        try:
+            dfile.unlink()
+        except Exception:
+            pass
+        return False  # Popen 실패 → 인라인 폴백
+    _append_activity(space, {
+        "상태": "chat_turn_dispatched", "시각": now_iso(), "actor": "공간관리", "target": wake,
+        "label": "채팅 턴 비동기 디스패치(방 안 막음)",
+        "detail": f"turn={turn_id} pid={proc.pid}", "turn_id": turn_id,
+        **_context_fields(context),
+    })
+    return True
+
+
+def record_chat_turn_failure(space: str, *, wake: str, context: dict | None, error: str) -> None:
+    """detached 채팅 턴 실패를 기록하고 응답의무·방 상태를 자가치유 경로로 되돌린다(wake_failed 대칭)."""
+    _append_activity(space, {
+        "상태": "chat_turn_failed", "시각": now_iso(), "actor": wake, "target": "CandidateQueue",
+        "label": "detached 채팅 턴 실패", "detail": str(error or "")[:200],
+        **_context_fields(context),
+    })
+    _safe_obligation(
+        space,
+        "reopen_after_chat_turn_failed",
+        lambda: response_obligation.reopen_for_context(
+            space, context, actor="시스템",
+            reason=f"detached 채팅 턴 실패({wake}) — 의무 재개: {str(error or '')[:160]}",
+        ),
+    )
+    try:
+        state = _load_json(_state_path(space), {})
+        if str(state.get("상태") or "") == "agent_running" and state.get("current") == wake:
+            _write_state(space, "idle", last_action="chat_turn_failed", last_target=wake,
+                         label="채팅 턴 실패", reason=str(error or "")[:200])
+    except Exception:
+        pass
+
+
+def publish_ready_chat_candidates(space: str) -> dict:
+    """detached 채팅 턴이 남긴 pending 후보(turn_id=chatturn_*)를 결정적으로(LLM 없이) 공개한다.
+
+    단일 pass 후보는 매니저가 이미 그 멤버에게 답을 시킨 것이라 선택 판단이 필요 없다 —
+    세대 펜스 확인 후 그 멤버 말풍선으로 곧바로 공개하고 응답의무를 닫는다(request_work 후보는
+    착수 알림만 공개, 의무는 delegated 유지 — _run_agent_turn의 announce_only와 동일 규칙).
+    호출처: run_chat_turn(자식) 직후 + _run_tick_chain 진입부 + reflow 백스톱(자식 사망 대비).
+    """
+    try:
+        snap = candidate_queue.snapshot(space)
+    except Exception:
+        return {"published": 0, "events": []}
+    pending = [
+        item for item in (snap.get("pending_items") or [])
+        if str(item.get("turn_id") or "").startswith(CHAT_TURN_ID_PREFIX)
+    ]
+    if not pending:
+        return {"published": 0, "events": []}
+    published = 0
+    events: list[dict] = []
+    for item in sorted(pending, key=lambda r: _as_int(r.get("source_event_seq"))):
+        candidate_id = str(item.get("candidate_id") or "")
+        if not candidate_id:
+            continue
+        try:
+            candidate = candidate_queue.get_candidate(space, candidate_id)
+        except Exception:
+            continue
+        if str(candidate.get("state") or "") != "pending_synthesis":
+            continue
+        context = _candidate_context(candidate)
+        if orchestration.is_context_stale(space, context):
+            try:
+                candidate_queue.supersede_candidates(
+                    space, [candidate_id], actor="시스템",
+                    reason="세대 변경 — 늦은 채팅 턴 후보 자동 정리", manager_claim_context=None,
+                )
+            except Exception:
+                pass
+            events.append({"type": "chat_candidate_stale", "candidate_id": candidate_id})
+            continue
+        delivery = transcript_state(space)
+        claim_result = manager_claim.acquire(
+            space, f"chat turn publish: {candidate_id}", delivery.get("last_event_seq"), context,
+        )
+        claim = claim_result.get("claim") or {}
+        if claim_result.get("corrupt") or not claim_result.get("acquired"):
+            # 다른 tick이 방을 쥐고 있다 — 그 체인의 진입부/다음 reflow가 이 후보를 회수한다.
+            events.append({"type": "chat_candidate_publish_deferred", "candidate_id": candidate_id})
+            break
+        outcome = "chat_turn_publish_failed"
+        try:
+            content = str(candidate.get("structured_public_reply") or candidate.get("reply") or "").strip()
+            publish_result = _publish_candidate_message(
+                space, claim=claim, candidate=candidate, candidates=[candidate],
+                content=content, mode="select", reason="단일 pass 채팅 턴 자동 공개",
+            )
+            candidate_queue.mark_selected(
+                space, candidate_id, actor="공간관리", reason="단일 pass 채팅 턴 자동 공개",
+                publish_effect_id=publish_result["publish_effect_id"],
+                published_message_id=publish_result["published_message_id"],
+                event_seq=publish_result.get("event_seq"),
+                manager_claim_context=claim,
+            )
+            orchestration.append_effect(space, {
+                "effect_id": publish_result["publish_effect_id"],
+                "effect_type": "chat_turn_candidate_public_append",
+                "candidate_id": candidate_id,
+                "candidate_turn_id": candidate.get("turn_id", ""),
+                "published_message_id": publish_result["published_message_id"],
+                "publish_ledger_claim": publish_result.get("publish_ledger_claim", ""),
+                **_context_fields(publish_result.get("context") or {}),
+                **_claim_fields(claim),
+            })
+            _append_activity(space, {
+                "상태": "chat_turn_published", "시각": now_iso(), "actor": "공간관리",
+                "target": candidate.get("target_agent", ""),
+                "label": "채팅 턴 응답 공개", "detail": content[:160],
+                "candidate_id": candidate_id,
+                "published_message_id": publish_result["published_message_id"],
+                **_context_fields(publish_result.get("context") or {}),
+                **_claim_fields(claim),
+            })
+            announce_only = str(candidate.get("structured_action") or "").strip() in {"request_work", "mixed"}
+            if not announce_only:
+                _safe_obligation(
+                    space,
+                    "answered_by_chat_turn",
+                    lambda pr=publish_result, cand=candidate: response_obligation.close_for_context(
+                        space, pr.get("context") or {}, outcome="answered", actor="공간관리",
+                        reason="detached 채팅 턴 응답 공개",
+                        published_message_id=pr["published_message_id"],
+                        responder=cand.get("target_agent", ""),
+                    ),
+                )
+            _write_state(space, "idle", last_action="chat_turn_published",
+                         last_target=candidate.get("target_agent", ""), label="채팅 턴 공개",
+                         **_context_fields(context), **_claim_fields(claim))
+            published += 1
+            outcome = "chat_turn_published"
+            events.append({
+                "type": "chat_turn_published", "candidate_id": candidate_id,
+                "person": candidate.get("target_agent", ""),
+                "published_message_id": publish_result["published_message_id"],
+            })
+        except orchestration.OrchestrationStaleError:
+            try:
+                candidate_queue.supersede_candidates(
+                    space, [candidate_id], actor="시스템",
+                    reason="세대 변경 — 늦은 채팅 턴 후보 자동 정리", manager_claim_context=claim,
+                )
+            except Exception:
+                pass
+            events.append({"type": "chat_candidate_stale", "candidate_id": candidate_id})
+        except candidate_queue.CandidateQueueError as exc:
+            # 공개할 본문이 없는 후보(request_work인데 public_reply 없음 등) — 작업은 이미 자식이
+            # 디스패치했으므로 후보만 정리한다(의무는 delegated 경로가 담당).
+            try:
+                candidate_queue.discard_candidates(
+                    space, [candidate_id], actor="시스템",
+                    reason=f"공개 불가 후보 정리: {_public_error_summary(exc)[:120]}",
+                    manager_claim_context=claim,
+                )
+            except Exception:
+                pass
+            events.append({"type": "chat_candidate_discarded", "candidate_id": candidate_id})
+        except Exception as exc:
+            events.append({
+                "type": "chat_turn_publish_failed", "candidate_id": candidate_id,
+                "error": _public_error_summary(exc),
+            })
+        finally:
+            _release_redrive(space, claim, outcome)
+    return {"published": published, "events": events}
+
+
+def _cleanup_stale_chat_dispatch(space: str) -> list[dict]:
+    """자식(run_chat_turn)이 죽어 남긴 낡은 디스패치 파일을 정리하고 의무·상태를 되돌린다(백스톱)."""
+    ddir = _chat_dispatch_dir(space)
+    if not ddir.is_dir():
+        return []
+    events: list[dict] = []
+    for dfile in sorted(ddir.glob("*.json")):
+        try:
+            if time.time() - dfile.stat().st_mtime <= CHAT_DISPATCH_STALE_SEC:
+                continue
+            params = _load_json(dfile, {}) or {}
+            record_chat_turn_failure(
+                space,
+                wake=str(params.get("wake") or ""),
+                context=params.get("context") or {},
+                error="chat dispatch stale — 자식 프로세스 사망 추정(응답 미도착)",
+            )
+            dfile.unlink()
+            events.append({"type": "chat_dispatch_stale_cleaned", "turn_id": params.get("turn_id", "")})
+        except Exception:
+            continue
+    return events
 
 
 def _dispatch_work_plan(
@@ -1401,6 +1731,90 @@ def execute_approved_plan(
     )
 
 
+# 디스패치 파일이 이 나이(초)를 넘도록 plan이 approved에 머물면 run_work가 죽은 것으로 보고 재디스패치.
+REDISPATCH_STALE_DISPATCH_SEC = 15 * 60
+
+
+def redispatch_deferred_plans(space: str) -> list[dict]:
+    """승인됐지만 착수하지 못한 plan을 재디스패치한다 — 종전엔 이 경로가 없었다.
+
+    _dispatch_work_plan은 동시 작업 상한(MAX_IN_FLIGHT_TASKS) 초과 시 plan을 approved로 남기고
+    보류하는데, 주석의 'reflow/다음 tick이 재시도'는 실제 코드가 없어 거짓이었다(감사 확정) —
+    상한에 걸린 승인 작업이 조용히 유실됐다. reflow 주기마다 여기서 회수한다.
+    레이스 가드: 디스패치 파일(dispatch/{plan_id}.json)이 방금 쓰였다면 run_work가 살아있을 수
+    있으므로 mtime이 임계(15분)를 넘긴 것만 재기동한다. 파일이 아예 없으면 상한 보류였던 것이라
+    즉시 재기동한다. 낡은 세대 plan은 supersede로 정리한다.
+    """
+    try:
+        plans = work_plan.list_plans(space, states={work_plan.APPROVED})
+    except Exception:
+        return []
+    plans = [p for p in plans if not str(p.get("task_id") or "").strip()]
+    if not plans:
+        return []
+    current_gen = orchestration.current_generation(space)
+    dispatch_dir = SPACES / space / "dispatch"
+    events: list[dict] = []
+    for plan in plans:
+        plan_id = str(plan.get("plan_id") or "")
+        rg = plan.get("room_generation")
+        if rg is not None and _as_int(rg) != current_gen:
+            try:
+                work_plan.supersede(space, [plan_id], actor="시스템",
+                                    reason=f"세대 전진(room_generation {current_gen})으로 낡은 승인 plan 정리")
+            except Exception:
+                pass
+            events.append({"type": "deferred_plan_superseded", "plan_id": plan_id})
+            continue
+        dfile = dispatch_dir / f"{plan_id}.json"
+        if dfile.exists():
+            try:
+                age_sec = max(0.0, time.time() - dfile.stat().st_mtime)
+            except Exception:
+                age_sec = 0.0
+            if age_sec < REDISPATCH_STALE_DISPATCH_SEC:
+                continue  # 최근 디스패치 — run_work가 진행 중일 수 있어 건드리지 않는다
+        try:
+            inflight = int(task_registry.snapshot(space).get("active_count") or 0)
+        except Exception:
+            inflight = 0
+        if inflight >= MAX_IN_FLIGHT_TASKS:
+            break  # 여전히 상한 — 다음 reflow 주기에 재시도
+        objective_for_work = plan.get("objective", "")
+        constraints = plan.get("constraints") or []
+        if constraints:
+            objective_for_work = objective_for_work + "\n\n# 제약\n" + "\n".join(f"- {item}" for item in constraints)
+        try:
+            detail = _dispatch_work_plan(
+                space,
+                plan_id=plan_id,
+                wake=plan.get("requesting_agent", ""),
+                worker=plan.get("worker", ""),
+                objective_for_work=objective_for_work,
+                effect_id=orchestration.effect_id("work_plan_redispatch", space, plan_id),
+                context={
+                    "intent_id": plan.get("intent_id", ""),
+                    "conversation_thread_id": plan.get("conversation_thread_id", ""),
+                    "room_generation": plan.get("room_generation"),
+                    "source_event_seq": plan.get("source_event_seq"),
+                    "source_message_id": plan.get("source_message_id", ""),
+                },
+                claim=None,
+                handoff_context_pack={},
+                turn_handoff_pack={},
+            )
+            events.append({"type": "deferred_plan_redispatched", "plan_id": plan_id, "detail": detail})
+        except Exception as exc:
+            events.append({"type": "deferred_plan_redispatch_failed", "plan_id": plan_id,
+                           "error": _public_error_summary(exc)})
+    if events:
+        _append_activity(space, {
+            "상태": "deferred_plan_redispatch", "시각": now_iso(), "actor": "시스템",
+            "label": "승인 후 미착수 plan 회수", "detail": f"{len(events)}건 처리",
+        })
+    return events
+
+
 def _append_guide_rule(space: str, rule: str, *, source: str = "대표 피드백") -> dict:
     """공간지침(방지침)에 학습된 규칙을 '누적 append'한다(덮어쓰기 아님, 중복 방지)."""
     rule = str(rule or "").strip()
@@ -1417,6 +1831,86 @@ def _append_guide_rule(space: str, rule: str, *, source: str = "대표 피드백
     text = text.rstrip() + f"\n{rule_line}  <!-- {source} {now_iso()[:10]} -->\n"
     path.write_text(text, encoding="utf-8")
     return {"appended": True}
+
+
+def _write_rolling_summary(space: str, summary: str) -> dict:
+    """롤링 누적요약을 요약.md에 기록한다 — append가 아니라 '전체 대체'다(사회자가 기존 요약 위에
+    최근 진행을 합쳐 갱신된 전문을 준다). 요약.md는 context_pack의 space_summary_excerpt로 다시
+    들어가 다음 wake의 누적 맥락이 된다(최근 창 밖으로 밀린 오래된 맥락의 보존처)."""
+    summary = str(summary or "").strip()
+    if not summary:
+        return {"written": False, "reason": "empty"}
+    path = SPACES / space / "요약.md"
+    body = f"# {space} 요약\n\n<!-- 롤링 누적요약 · 공간관리 자동갱신 {now_iso()[:19]} -->\n\n{summary}\n"
+    path.write_text(body, encoding="utf-8")
+    return {"written": True, "char_count": len(summary)}
+
+
+_DEPLOY_ROOTS = {"스킬", "지식", "도구", "앱", "자산"}
+
+
+def _deploy_staged_outputs(space: str, release: dict) -> list[str]:
+    """이식/파일생성 작업이 작업폴더 `이식산출/`에 미러 구조로 스테이징한 산출물을, release 공개 시
+    실제 목적지(루트의 스킬/·지식/·도구/·앱/·자산/)로 배치한다. release는 결과 '메시지'만 공개하고
+    파일을 옮기지 않던 빈틈을 메운다 — 그래서 이식 스킬이 만들어지고도 발견기에 안 잡히던 문제 해소.
+    안전: 알려진 최상위 폴더만, `이식산출/` 아래 것만, 예외안전. work_dir 없으면 no-op(대부분 작업)."""
+    import shutil
+    worker = str(release.get("worker_agent") or "").strip()
+    task_id = str(release.get("source_task_id") or "").strip()
+    if not worker or not task_id:
+        return []
+    staged = PEOPLE / worker / "공간" / space / "작업" / task_id / "이식산출"
+    if not staged.is_dir():
+        return []
+    root = SPACES.parent
+    deployed: list[str] = []
+    for top in staged.iterdir():
+        if not top.is_dir() or top.name not in _DEPLOY_ROOTS:
+            continue
+        for src in top.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(staged)          # 예: 스킬/추가/보철근배근v2/SKILL.md
+            # 지식 발견 규약 정규화: 발견기는 지식을 '지식/<등급>/<이름>/지식.md'(폴더+지식.md)로만 스캔한다
+            # (discovery.py: knowledge filename="지식.md"). 작업자가 평면 '지식/<등급>/<이름>.md'로 스테이징하면
+            # 배포돼도 발견기에 안 잡힌다(실증 2026-07-01 시공지식 31건 누락). 평면 지식 .md를 폴더형으로 접어 배치한다.
+            parts = rel.parts
+            if (top.name == "지식" and len(parts) == 3
+                    and parts[2].endswith(".md") and parts[2] != "지식.md"):
+                name = parts[2][:-3]               # <이름>.md → <이름>
+                rel = Path(parts[0]) / parts[1] / name / "지식.md"
+            dest = root / rel
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+                deployed.append(rel.as_posix())
+            except Exception:
+                continue
+    return deployed
+
+
+def _resolve_app(ref: str) -> dict | None:
+    """앱 이름 또는 앱 폴더경로(ref)로 등록된 앱을 찾는다. 등록 앱만 허용(임의 명령 차단)."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return None
+    from . import apps as core_apps
+    try:
+        apps_list = core_apps.list_apps().get("apps", [])
+    except Exception:
+        return None
+    ref_l = ref.lower().strip("/")
+    # 1) dir 정확일치 → 2) 이름 정확일치 → 3) 이름/ dir 부분일치
+    for a in apps_list:
+        if str(a.get("dir", "")).strip("/").lower() == ref_l:
+            return a
+    for a in apps_list:
+        if str(a.get("name", "")).strip().lower() == ref_l:
+            return a
+    for a in apps_list:
+        if ref_l in str(a.get("name", "")).lower() or ref_l in str(a.get("dir", "")).lower():
+            return a
+    return None
 
 
 def _append_space_knowledge(space: str, claim: str, *, source: str = "대표 피드백") -> dict:
@@ -1439,6 +1933,25 @@ def reject_plan(space: str, plan_id: str, *, actor: str = "대표", reason: str 
     """대표가 작업계획을 반려한다 — plan rejected + 결재 마커 해제 + 활동기록(P5 라우터에서 사용)."""
     result = work_plan.reject(space, plan_id, actor=actor, reason=reason)
     _clear_approval_required(space, plan_id)
+    # 반려도 대표의 처리다 — plan 승인 대기 때 'assigned'로 잡아둔 응답의무를 manager_closed로 종결한다.
+    # 안 닫으면 원장에 영구 assigned로 남아 미응답으로 오인된다(스냅샷 open_items·overdue 오염).
+    _rec = result.get("record") or {}
+    if _rec.get("source_message_id") or _rec.get("source_event_seq") is not None:
+        _safe_obligation(
+            space,
+            "closed_by_plan_reject",
+            lambda: response_obligation.close_for_context(
+                space,
+                {
+                    "source_event_seq": _rec.get("source_event_seq"),
+                    "source_message_id": _rec.get("source_message_id", ""),
+                    "room_generation": _rec.get("room_generation"),
+                },
+                outcome="manager_closed",
+                actor=actor,
+                reason=f"작업계획 반려: {str(reason or '')[:200]}",
+            ),
+        )
     _append_activity(space, {
         "상태": "work_plan_rejected",
         "시각": now_iso(),
@@ -1525,6 +2038,59 @@ def _handle_chat_agent_result(
             **_claim_fields(claim),
         })
         return f"기존 작업 재지시(중복 기동 방지): {worker} task={_busy_id}"
+
+    # ── 중복 결재대기 방지: 같은 worker에 이미 '결재 대기(pending_approval)' plan이 있으면 새로 만들지 않는다 ──
+    # 실증 2026-06-29: 구조적으로 게이트된 3단계를 구현자가 9분간 6번 재요청 → pending_approval plan 6개 누적
+    # (헛돎·결재 말풍선 스팸). 위 running 가드는 pending_approval을 못 막는다(state=running만 봄). 게다가
+    # plan_id가 objective 기반 stable_id라 요청 문구가 조금만 달라도 매번 새 plan이 생긴다. 그래서 한 worker는
+    # 동시에 '미결 결재 plan'도 하나만 갖게 막는다 — 이미 있으면 재요청을 흡수하고 대표 승인/반려를 기다린다
+    # (목표.md: 헛돎·폭주 금지). 죽은/처리된 plan은 latest state가 PENDING이 아니므로 자동 제외된다.
+    try:
+        _pending_same_worker = [
+            p for p in work_plan.list_plans(space, states={work_plan.PENDING})
+            if p.get("worker") == worker
+        ]
+    except Exception:
+        _pending_same_worker = []
+    # 세대(room_generation)가 지난 pending plan은 낡은 결재다 — 대표가 방향을 바꾸거나 작업이 취소돼
+    # 세대가 전진했는데도 supersede가 안 불려(전이 트리거 부재) 그 worker의 새 작업을 영구 차단했다
+    # (감사 확정: 대표가 결재 말풍선을 방치하면 worker가 영원히 막힘). 낡은 세대 plan은 여기서
+    # superseded로 정리하고 차단 근거에서 제외한다.
+    if _pending_same_worker:
+        _current_gen = orchestration.current_generation(space)
+        _stale_plans = [
+            p for p in _pending_same_worker
+            if p.get("room_generation") is not None and _as_int(p.get("room_generation")) != _current_gen
+        ]
+        if _stale_plans:
+            try:
+                work_plan.supersede(
+                    space,
+                    [p.get("plan_id", "") for p in _stale_plans],
+                    actor="시스템",
+                    reason=f"세대 전진(room_generation {_current_gen})으로 낡은 결재대기 plan 자동 정리",
+                )
+            except Exception:
+                pass
+            else:
+                _stale_ids = {p.get("plan_id", "") for p in _stale_plans}
+                _pending_same_worker = [
+                    p for p in _pending_same_worker if p.get("plan_id", "") not in _stale_ids
+                ]
+    if _pending_same_worker:
+        _existing_plan = _pending_same_worker[0].get("plan_id", "")
+        _append_activity(space, {
+            "상태": "chat_request_work_pending_dedup",
+            "시각": now_iso(),
+            "actor": wake,
+            "target": worker,
+            "label": "이미 결재 대기 중 — 중복 plan 생성 차단",
+            "detail": f"worker={worker} 이미 pending_approval plan={_existing_plan} → 새 plan 안 만듦(헛돎/스팸 방지). 대표 승인/반려 대기.",
+            "plan_id": _existing_plan,
+            **_context_fields(context),
+            **_claim_fields(claim),
+        })
+        return f"이미 결재 대기 중(중복 방지): {worker} plan={_existing_plan} — 대표 승인/반려를 기다림"
 
     # ── 승인 게이트 (설계_작업계획승인.md) ──────────────────────────────────
     # 곧장 engine.work() 하지 않는다. 먼저 '계획'을 등록하고, 승인 필요 여부로 분기한다.
@@ -2005,8 +2571,14 @@ def publish_release(space: str, release_id: str, *, actor: str = "대표", text:
     # 완료 보고는 '공간관리'가 아니라 실제 작업을 한 워커(에이전트) 명의로 방에 올린다.
     # (공간관리는 오케스트레이션만 — 말풍선을 남기지 않는다. 화자 없으면 공간관리로 폴백.)
     worker_token = str(release.get("worker_agent") or "").strip()
-    speaker_disp = worker_token.rsplit("_", 1)[0] if worker_token else "공간관리"
-    speaker_cd = worker_token or "manager"
+    # split_token으로 통일 — 종전엔 이 경로만 코드에 토큰 전체(pm_266f)를 넣어 다른 경로(266f)와
+    # 화자 코드가 갈렸다(같은 pm이 두 화자로 보이는 attribution 혼선, 실방 실측).
+    if worker_token and "_" in worker_token:
+        speaker_disp, speaker_cd = split_token(worker_token)
+    elif worker_token:
+        speaker_disp, speaker_cd = worker_token, worker_token
+    else:
+        speaker_disp, speaker_cd = "공간관리", "manager"
     try:
         claim_row = publish_ledger.claim_publish(
             space,
@@ -2081,6 +2653,18 @@ def publish_release(space: str, release_id: str, *, actor: str = "대표", text:
             **_context_fields(context),
             **_claim_fields(claim),
         })
+        # 이식/파일생성 산출물 자동 배치: 작업폴더 이식산출/ → 루트(스킬/지식/도구/앱/자산). 예외안전.
+        try:
+            _deployed = _deploy_staged_outputs(space, release)
+            if _deployed:
+                _append_activity(space, {
+                    "상태": "staged_outputs_deployed", "시각": now_iso(), "actor": actor,
+                    "target": release.get("source_task_id", ""),
+                    "label": "이식 산출물 자동 배치", "detail": f"{len(_deployed)}개: " + ", ".join(_deployed[:5]),
+                    **_context_fields(context),
+                })
+        except Exception:
+            pass
         _safe_obligation(
             space,
             "answered_by_release_publish",
@@ -3359,6 +3943,10 @@ def _auto_continue_after_pass(result: dict) -> bool:
     for ev in result.get("events") or []:
         if ev.get("type") in blocking:
             return False
+        if ev.get("type") == "chat_turn_dispatched":
+            # 응답이 아직 백그라운드에서 생성 중 — 이 체인에서 이어봤자 볼 게 없다.
+            # 연속은 자식(run_chat_turn)의 publish 후 tick이 잇는다.
+            return False
     return True
 
 
@@ -3368,6 +3956,38 @@ def _has_pending_candidates(space: str) -> bool:
         return int(candidate_queue.snapshot(space).get("pending_count") or 0) > 0
     except Exception:
         return False
+
+
+def _live_work_worker_tokens(space: str) -> set[str]:
+    """살아 일하는(하트비트 신선 또는 콜드스타트 grace) 백그라운드 작업을 쥔 작업자 토큰 집합.
+
+    갓 디스패치된 작업은 첫 heartbeat 전이라 missing→stale로 뜨지만 실제로는 '시작 중=살아있음'이다.
+    이 콜드스타트 창(startup_grace)도 live로 센다(디스패치 직후 창을 놓치면 auto_continue가 뚫려
+    작업자를 또 깨우고 '생각 중'이 깜빡인다 — 대표 신고)."""
+    tokens: set[str] = set()
+    try:
+        for a in (task_registry.snapshot(space).get("active_items") or []):
+            if not a.get("heartbeat_stale") or a.get("heartbeat_startup_grace"):
+                w = a.get("worker_agent")
+                if w:
+                    tokens.add(str(w))
+    except Exception:
+        pass
+    return tokens
+
+
+def _has_live_work_task(space: str) -> bool:
+    """방에 하트비트 신선한(살아 일하는) 백그라운드 작업이 있는지."""
+    return bool(_live_work_worker_tokens(space))
+
+
+def _free_dialogue_members(space: str) -> set[str]:
+    """지금 대화를 이어받을 수 있는 '자유' 멤버(= live 작업을 쥐지 않은 멤버) 토큰.
+    작업이 도는 동안 다자대화를 이 멤버들로 이어간다(바쁜 작업자 재-wake 없이)."""
+    try:
+        return _member_tokens(space) - _live_work_worker_tokens(space)
+    except Exception:
+        return set()
 
 
 def _should_auto_continue(space: str, result: dict) -> bool:
@@ -3381,11 +4001,23 @@ def _should_auto_continue(space: str, result: dict) -> bool:
         return False
     if result.get("stale") or result.get("claim_busy") or result.get("claim_corrupt") or result.get("generation_stale"):
         return False
+    # 라이브 백그라운드 작업이 있을 때: 예전엔 무조건 멈춰, 작업이 도는 동안 방이 작업자 외엔
+    # 침묵(1인 독백)했다(대표 신고: "에이전트끼리 대화를 안 한다"). 이제는 **바쁜 작업자 말고
+    # 대화를 이어받을 자유 멤버가 있으면 계속**한다 — 작업은 뒤에서 async로 돌고, 그 사이 검토가·pm
+    # 등이 다자대화를 진행한다(목표: 대화는 작업에 막히지 않는다). 아래 정상 연속 사유가 있을 때만
+    # 잇고, 바쁜 작업자 재-wake는 자유멤버용 이벤트 안내 + _run_tick_chain의 하드가드가 막는다.
+    # (자유 멤버가 없으면 = 얘기할 상대가 작업자뿐 → 예전처럼 멈춰 완료를 기다린다.)
+    if _has_live_work_task(space) and not _free_dialogue_members(space):
+        return False
     if _auto_continue_after_pass(result):
         return True
     if _decision_is_self_growth(result):       # 규칙/스킬/지식 반영 후 → 그 규칙대로 재작업할 기회를 준다
         return True
     if _decision_is_publish_each(result):      # 다자 의견 공개 후 → 토론 '반응 라운드'를 이을 기회를 준다(매니저가 판단)
+        return True
+    if _decision_is_update_summary(result):    # 누적요약 갱신(내부 유지보수) 후 → 본 턴(대표 발언 등)을 이어서 처리
+        return True
+    if _decision_is_launch_app(result):        # 앱 실행(작업의 전제) 성공 후 → 남은 요청(팀구성·방지침·조작 위임 등)을 이어서 처리
         return True
     return _has_pending_candidates(space)
 
@@ -3399,6 +4031,28 @@ def _decision_is_publish_each(result: dict) -> bool:
     """직전 결정이 다자 공개(publish_each)였나 — 토론 반응 라운드를 잇기 위한 판정.
     이후 자동연속은 AUTO_CONTINUE_MAX_TURNS로 상한되며, 토론이 아니면 매니저가 stop한다."""
     return bool((result or {}).get("ok")) and (result.get("decision") or {}).get("action") == "publish_each"
+
+
+def _decision_is_update_summary(result: dict) -> bool:
+    """직전 결정이 롤링 누적요약 갱신이었나 — 요약은 내부 유지보수라 갱신 후 본 턴을 이어서 처리한다."""
+    return bool((result or {}).get("ok")) and (result.get("decision") or {}).get("action") == "update_summary"
+
+
+def _decision_is_launch_app(result: dict) -> bool:
+    """직전 결정이 앱 실행(launch_app)이고 성공했나 — 앱 실행은 대개 '요청의 전부'가 아니라
+    '작업의 전제'(예: "revit을 실행해서 거기서 작업하려고 팀을 구성하자")라, 실행 성공 후 본 턴을
+    이어 매니저가 남은 요청(팀 구성 위임·방지침 update_guide·앱 조작 pass 등)을 처리하게 한다.
+    실행이 곧 요청 전부인 단순 실행이면, 이어진 턴에서 매니저가 stop을 택해 그 경로가 응답의무를
+    manager_closed로 닫는다(회귀안전). 실패한 실행은 이어붙이지 않는다(앱 오탐 재시도 루프 방지 —
+    실패 노트로 대표 확인을 기다린다)."""
+    if not (result or {}).get("ok"):
+        return False
+    if (result.get("decision") or {}).get("action") != "launch_app":
+        return False
+    for ev in result.get("events") or []:
+        if ev.get("type") == "app_launched":
+            return bool(ev.get("ok"))
+    return False
 
 
 def _pending_candidate_count(space: str) -> int:
@@ -3421,10 +4075,13 @@ def _candidate_drain_event(pending: int, drain: int) -> str:
 
 
 def _open_user_obligations(space: str) -> list[dict]:
-    """아직 답이 시작도 안 된(state='open') 대표 입력의 응답의무만 — 즉 '누락된' 입력.
+    """아직 답이 안 나간 대표 입력의 응답의무 — state='open' + '고아 assigned'(기한 초과).
 
-    assigned/delegated는 이미 멤버에게 넘겼거나 task로 진행 중(in-flight)이라 누락이 아니므로 제외한다.
-    open만이 매니저가 보긴 했어도(읽음) 아무 행동도 안 한, 빠른 연속 입력에서 빠뜨린 입력이다.
+    assigned/delegated는 원칙적으로 in-flight라 제외하지만, assigned로 넘긴 턴이 발행 없이 죽으면
+    (엔진 실패가 wake_failed 경로를 안 타거나, 후보 전원 실패/전량 폐기) 의무가 assigned로 영구 고아가
+    된다 — 실증(레빗_bcd7): assigned 11시간+ 방치, 대표 입력 무응답. overdue(assigned 기한 5분 초과)인
+    assigned는 open으로 되돌려 sweep이 재구동하게 한다. delegated는 task/release 상태가 정본이라
+    여기서 되살리지 않는다(reflow 백스톱 소관).
     target_actor=space_manager(=open_for_message가 다는 값)인 대표 입력으로 한정한다.
     """
     try:
@@ -3435,9 +4092,30 @@ def _open_user_obligations(space: str) -> list[dict]:
         return []
     out = []
     for item in snap.get("open_items") or []:
-        if item.get("state") != "open":
-            continue
         if item.get("target_actor") not in ("space_manager", "space", ""):
+            continue
+        state = item.get("state")
+        if state == "assigned" and item.get("overdue"):
+            reopened = _safe_obligation(
+                space,
+                "reopen_orphaned_assigned",
+                lambda it=item: response_obligation.reopen_for_context(
+                    space,
+                    {
+                        "source_event_seq": it.get("source_event_seq"),
+                        "source_message_id": it.get("source_message_id", ""),
+                        "intent_id": it.get("intent_id", ""),
+                        "conversation_thread_id": it.get("conversation_thread_id", ""),
+                        "room_generation": it.get("room_generation"),
+                    },
+                    actor="시스템",
+                    reason=f"assigned {item.get('age_ms', 0)}ms 경과·발행 없음 — 고아 의무 자동 재개",
+                ),
+            )
+            if reopened and reopened.get("ok") and not reopened.get("terminal"):
+                out.append({**item, "state": "open"})
+            continue
+        if state != "open":
             continue
         out.append(item)
     out.sort(key=lambda it: _as_int(it.get("source_event_seq")))
@@ -3485,6 +4163,12 @@ def _obligation_sweep_context(target: dict) -> dict:
 
 
 def _run_tick_chain(space: str, event: str, context: dict | None = None, *, auto_continue: bool = False) -> dict:
+    # 진입 전 flush: detached 채팅 턴이 남긴 공개 대기 후보(claim 경합으로 deferred됐던 것 포함)를
+    # 결정적으로 먼저 공개한다 — 이 체인의 매니저가 최신 대화 위에서 판단하게 된다(LLM 비용 0).
+    try:
+        publish_ready_chat_candidates(space)
+    except Exception:
+        pass
     result = _tick_unlocked(space, event, context)
     combined = dict(result)
     combined["events"] = list(result.get("events") or [])
@@ -3563,6 +4247,17 @@ def _run_tick_chain(space: str, event: str, context: dict | None = None, *, auto
                 "반응 라운드는 보통 1~2회면 충분하다. **토론이 무르익었으면 synthesize_candidates로 결론을 한 답으로 정리**하고, "
                 "대표가 토론을 요청한 게 아니거나(단순 인사·잡담) 더 보탤 게 없으면 stop으로 대표에게 턴을 넘긴다."
             )
+        elif _has_live_work_task(space):
+            busy = ", ".join(sorted(_live_work_worker_tokens(space))) or "작업자"
+            cont_event = (
+                f"백그라운드 작업 진행 중 다자대화 자동 연속(turn {auto_turns}/{AUTO_CONTINUE_MAX_TURNS}): "
+                f"지금 [{busy}]가 작업을 백그라운드로 수행 중이다(heartbeat 살아있음, 결과는 완료 시 돌아온다). "
+                "**그 작업자를 다시 깨우지 마라** — 재호출은 '생각 중'만 헛깜빡이고 진전이 없다. "
+                "대신 **작업을 안 쥔 다른 멤버로 대화를 진행**시켜 협업을 앞세워라: 예) 검토가에게 완성물 판정 기준을 "
+                "미리 맞추게 하거나(pass), 여러 관점이 필요하면 parallel_pass로 검토가·pm을 함께, "
+                "다음 단계·리스크를 정리하게 한다. 진행 확인이 꼭 필요하면 request_progress를 한 번만. "
+                "지금 다른 멤버가 실질적으로 보탤 게 없으면 stop으로 대표에게 턴을 넘긴다(헛돌지 않는다)."
+            )
         else:
             cont_event = (
                 f"에이전트 응답 후 자동 연속(turn {auto_turns}/{AUTO_CONTINUE_MAX_TURNS}): "
@@ -3572,6 +4267,7 @@ def _run_tick_chain(space: str, event: str, context: dict | None = None, *, auto
                 "다음 단계가 분명하면 그 멤버에게 pass하고, 대표 승인·최종 보고가 필요하거나 협업이 일단락돼 더 할 일이 없으면 "
                 "stop으로 멈춰 대표에게 턴을 넘긴다(핸드백)."
             )
+        live_before = _live_work_worker_tokens(space)
         combined["events"].append({"type": "manager_auto_continue", "auto_turn": auto_turns})
         result = _tick_unlocked(space, cont_event, None)
         combined["events"].extend(result.get("events") or [])
@@ -3579,6 +4275,20 @@ def _run_tick_chain(space: str, event: str, context: dict | None = None, *, auto
             combined["decision"] = result["decision"]
         combined["ok"] = bool(combined.get("ok", True) and result.get("ok", False))
         if result.get("claim_busy") or result.get("stale"):
+            break
+        # 하드가드: 이번 자동연속이 '바쁜 작업자'를 다시 깨웠으면 더 잇지 않고 멈춘다. 안내대로라면
+        # 자유 멤버로 갔어야 하는데 작업자를 재-wake했다면, 반복되면 '생각 중'이 깜빡이므로 여기서 끊는다.
+        _dec = result.get("decision") or {}
+        _rewoke_busy = (
+            (_dec.get("action") == "pass" and _dec.get("wake") in live_before)
+            or (_dec.get("action") == "parallel_pass"
+                and any((t or {}).get("wake") in live_before for t in (_dec.get("targets") or [])))
+        )
+        if _rewoke_busy:
+            combined["events"].append({
+                "type": "manager_auto_continue_yielded",
+                "reason": "would_rewake_busy_worker",
+            })
             break
         # 자동 연속 중 새 대표 입력 coalesce가 끼면 그 redrive를 우선 처리한다.
         nr = _redrive_event_from(result)
@@ -3827,6 +4537,15 @@ def _prompt_room_status_snapshot(space: str) -> dict:
     rapid = st.get("rapid_input") or {}
     obligations = st.get("response_obligations") or {}
     memory = st.get("space_memory") or {}
+    # 결재대기(pending_approval)·승인후 미실행(approved) 작업계획 — 종전 스냅샷엔 work_plans가 없어 사회자가
+    # '이미 결재 대기 중인 계획'을 못 봤고, 같은 worker를 계속 깨워 중복 요청이 쌓였다(실증 2026-06-29:
+    # 게이트된 3단계를 9분간 6번 재요청 → pending plan 6개·재선언 헛돎). 이걸 노출해 사회자가 재디스패치
+    # 대신 '대표 결재 대기'를 인식·존중하게 한다(목표.md: 헛돎·폭주 금지).
+    try:
+        _unstarted_plans = work_plan.list_plans(space, states={work_plan.PENDING, work_plan.APPROVED})
+    except Exception:
+        _unstarted_plans = []
+    _pending_plans = [p for p in _unstarted_plans if p.get("state") == work_plan.PENDING]
     return {
         "schema": "RoomStatusSnapshot.prompt.v1",
         "snapshot_status": "ok",
@@ -3836,6 +4555,28 @@ def _prompt_room_status_snapshot(space: str) -> dict:
         "status_stale": bool(st.get("status_stale")),
         "manager_read_lag": st.get("manager_read_lag", 0),
         "projection_lag": st.get("projection_lag", 0),
+        "work_plans": {
+            "pending_approval_count": len(_pending_plans),
+            "approved_unstarted_count": len(_unstarted_plans) - len(_pending_plans),
+            "pending_items": [
+                {
+                    "plan_id": p.get("plan_id", ""),
+                    "worker": p.get("worker", ""),
+                    "requesting_agent": p.get("requesting_agent", ""),
+                    "objective_preview": str(p.get("objective", ""))[:140],
+                    "state": p.get("state", ""),
+                }
+                for p in _pending_plans[:6]
+            ],
+            "note": (
+                "결재 대기 중인 작업계획이 있다. 이미 대표 결재를 기다리는 중이니, **같은 worker에게 같은 일을 "
+                "다시 시키지 마라(action=work/pass로 재디스패치 금지 — 중복 plan·재선언 헛돎을 만든다).** "
+                "대표 결재가 나야 실행된다 — 결재가 필요하면 stop으로 대표에게 턴을 넘겨 승인/반려를 받아라. "
+                "그 작업이 구조적으로 막혔거나(예: 런타임 권한·자격증명 부재) 더 진행 불가하면 stop으로 대표에게 "
+                "사실과 필요한 것을 보고하라(같은 작업을 반복 기동하지 마라)."
+                if _pending_plans else ""
+            ),
+        },
         "space_memory": {
             "memory_source": memory.get("memory_source", ""),
             "projection_available": bool(memory.get("projection_available")),
@@ -4316,26 +5057,55 @@ def _normalize_decision(space: str, decision: dict, member_tokens: set[str]) -> 
         return decision
     if str(decision.get("action") or "").strip() != "parallel_pass":
         return decision
-    raw_targets = decision.get("targets")
-    if not isinstance(raw_targets, list):
-        return decision
     aliases = _member_aliases(space)
-    fixed = []
-    for item in raw_targets:
-        if not isinstance(item, dict):
-            continue
-        wake = str(item.get("wake") or item.get("target_agent") or "").strip()
+
+    def _resolve(wake: str) -> str:
+        wake = str(wake or "").strip()
         if wake and wake not in member_tokens:
             resolved = chat_result.resolve_worker(wake, member_tokens, aliases)
             if resolved:
-                wake = resolved
+                return resolved
+        return wake
+
+    raw_targets = decision.get("targets")
+    if not isinstance(raw_targets, list):
+        raw_targets = []
+    fixed = []
+    seen_wakes = set()
+    for item in raw_targets:
+        if not isinstance(item, dict):
+            continue
+        wake = _resolve(item.get("wake") or item.get("target_agent"))
+        if wake in seen_wakes:
+            continue  # 같은 멤버 중복 지정 — 첫 항목만 유지(검증 거부 대신 구제)
+        seen_wakes.add(wake)
         fixed.append({**item, "wake": wake})
     decision = {**decision, "targets": fixed}
-    valid = [t for t in fixed if t.get("wake") in member_tokens and str(t.get("message") or "").strip()]
+    top_message = str(decision.get("message") or "").strip()
+    if not fixed:
+        # 실방 반복 위반(하루 6 tick 재요청): targets 리스트 없이 top-level wake/message로 낸
+        # parallel_pass. 재요청으로 같은 실수를 반복시키는 대신 단일 pass로 강등해 진행시킨다.
+        top_wake = _resolve(decision.get("wake"))
+        if top_wake in member_tokens and top_message:
+            return {**decision, "action": "pass", "wake": top_wake, "message": top_message}
+        return decision
+    valid = []
+    for t in fixed:
+        if t.get("wake") not in member_tokens:
+            continue
+        message = str(t.get("message") or "").strip() or top_message
+        if message:
+            valid.append({**t, "message": message})
     if len(valid) == 1:
         t = valid[0]
         return {**decision, "action": "pass", "wake": t["wake"],
                 "message": str(t.get("message") or ""), "targets": fixed}
+    if len(valid) == len(fixed) and any(
+        str(t.get("message") or "").strip() != str(v.get("message") or "")
+        for t, v in zip(fixed, valid)
+    ):
+        # 개별 message가 비어 top-level message로 채워진 경우 반영
+        return {**decision, "targets": valid}
     return decision
 
 
@@ -4458,6 +5228,16 @@ def _decision_error(obj: dict, member_tokens: set[str] | None = None) -> str:
             return "update_guide이면 wake는 빈 문자열이어야 함"
         if not message:
             return "update_guide는 message에 방지침에 기록할 규칙이 필요함"
+    if action == "update_summary":
+        if wake:
+            return "update_summary이면 wake는 빈 문자열이어야 함"
+        if not message:
+            return "update_summary는 message에 갱신된 누적요약 전문이 필요함"
+    if action == "launch_app":
+        if wake:
+            return "launch_app이면 wake는 빈 문자열이어야 함(시스템이 실행 대행)"
+        if not str(obj.get("app") or "").strip():
+            return "launch_app은 app 필드에 앱 이름 또는 앱 폴더경로가 필요함"
     if action == "propose_knowledge":
         if wake:
             return "propose_knowledge이면 wake는 빈 문자열이어야 함"
@@ -4649,7 +5429,9 @@ def _space_context(space: str, event: str, context: dict | None = None, manager_
         "- 별개·무관한 이야기거나 단순 코멘트·질문이면: 진행 중 작업(task)을 건드리지 말고, 그 입력만 별도로 처리(답변/적합한 멤버 pass)한 뒤 원래 작업은 그대로 이어가게 둔다.\n"
         "- 추가 요청이면: 기존 작업은 두고 새 작업 흐름을 더한다.\n"
         "- 방향 전환·정정·재지시 의도가 분명하면: RoomStatusSnapshot.tasks에서 대상 task_id를 특정해 revise_task(재지시) 또는 cancel_task(취소)를 낸다.\n"
-        "- 진행 상황을 묻는 것이면: request_progress로 중간 보고를 요청한다.\n"
+        "- 진행 상황을 묻는 것이면(예: '진행중이야?', '어디까지 됐어?'): **답을 미루지 말고 즉시 답한다.** "
+        "RoomStatusSnapshot.tasks의 실행 상태(작업 진행 중 여부·heartbeat·단계)를 근거로, **작업 중이 아닌 멤버(채팅에이전트, 예: pm)에게 pass**해 '지금 무엇을 백그라운드로 하고 있고 어디까지 왔는지'를 대표에게 바로 알린다. "
+        "작업은 별도 세션에서 백그라운드로 계속 도니, request_progress로 대표 답변을 대신하지 마라 — request_progress는 대표 즉답과 별개로, 작업이 오래 정체돼(heartbeat stale) 실제 체크포인트가 필요할 때만 쓴다. 대표는 항상 '지금 작업 중이다'를 바로 확인받아야 한다.\n"
         "- 승인·확인·답변이면: 그에 맞춰 보류 중이던 공개/다음 단계를 진행한다.\n"
         "근거 없이 진행 중 작업을 멈추거나, 반대로 분명한 재지시를 무시하지 않는다. 애매하면 작업을 보존하고 대표 의도를 좁히는 쪽으로 판단한다.\n\n"
     )
@@ -4860,9 +5642,18 @@ def reflow(space: str) -> dict:
     except Exception as exc:
         return {"ok": False, "error": _public_error_summary(exc), "published": 0, "events": events}
     pending = snap.get("pending_items") or []
+    # approve는 성공했는데 publish가 실패한(claim 경합·프로세스 킬) release는 pending_items에서
+    # 빠져 종전 reflow가 영원히 재시도하지 않았다 — 승인됐지만 방에 못 뜬 결과가 approved(granted)
+    # 상태로 영구 고아(감사 확정 경로). granted인데 미발행인 것을 재시도 대상에 합류시킨다.
+    approved_unpublished = [
+        item for item in (snap.get("approved_items") or [])
+        if item.get("state") not in ("published", "rejected")
+    ]
     current_gen = orchestration.current_generation(space)
     published = 0
-    for item in sorted(pending, key=lambda r: _as_int(r.get("source_event_seq"))):
+    for item in sorted(pending, key=lambda r: _as_int(r.get("source_event_seq"))) + sorted(
+        approved_unpublished, key=lambda r: _as_int(r.get("source_event_seq"))
+    ):
         if published >= REFLOW_MAX_PER_CALL:
             break
         release_id = item.get("release_id") or item.get("release_queue_id")
@@ -4888,6 +5679,40 @@ def reflow(space: str) -> dict:
             "상태": "reflow_published", "시각": now_iso(), "actor": "공간관리",
             "label": "작업 결과 회수·공개", "detail": f"{published}건", "room_generation": current_gen,
         })
+    # 승인 후 미착수 plan 회수(상한 보류·run_work 사망) — 같은 백스톱 주기에 태워 자동 재기동한다.
+    try:
+        events.extend(redispatch_deferred_plans(space))
+    except Exception:
+        pass
+    # detached 채팅 턴 백스톱 — 자식이 못 올린 공개 대기 후보 회수 + 죽은 자식의 디스패치 잔재 정리.
+    try:
+        chat_pub = publish_ready_chat_candidates(space)
+        events.extend(chat_pub.get("events") or [])
+        published += int(chat_pub.get("published") or 0)
+    except Exception:
+        pass
+    try:
+        events.extend(_cleanup_stale_chat_dispatch(space))
+    except Exception:
+        pass
+    # 자기성장 백스톱 — 승격 대상 레슨을 자동으로 승격후보에 올린다(멱등 — already_exists 스킵).
+    # 종전엔 이 스캔의 유일한 트리거가 대시보드 수동 버튼이라 promotion_candidates 파일이 전 공간
+    # 통틀어 생성된 적이 없었다(성장루프 공회전 원인 2). 승인·적용은 설계대로 대표 게이트 유지.
+    try:
+        scan = lesson_ledger.generate_promotion_candidates(space, actor="시스템자동", limit=10)
+        if int(scan.get("created_count") or 0) > 0:
+            events.append({"type": "promotion_candidates_created", "count": scan.get("created_count")})
+            _append_activity(space, {
+                "상태": "promotion_candidates_created", "시각": now_iso(), "actor": "시스템",
+                "label": "레슨 승격후보 자동 생성(대표 승인 대기)",
+                "detail": f"{scan.get('created_count')}건 — 대시보드 학습 패널에서 승인/반려",
+            })
+    except Exception:
+        pass
+    try:
+        lesson_ledger.expire_stale_growth_gaps(space)
+    except Exception:
+        pass
     return {"ok": True, "published": published, "pending_remaining": max(0, len(pending) - published), "events": events}
 
 
@@ -4974,6 +5799,34 @@ def reflow_all_spaces() -> list[dict]:
         except Exception:
             # reflow_safe는 본래 예외를 던지지 않지만, 한 공간 실패가 다른 공간 공개를 막지 않게 이중 방어.
             pass
+    return results
+
+
+def reap_stale_tasks_all_spaces() -> list[dict]:
+    """모든 공간에서 heartbeat가 끊긴 비종결 작업을 강제 finalize하는 자동복구 reaper(주기 백스톱).
+
+    엔진 타임아웃/워커 하드킬로 '완료했는데 finalize 안 돼 active에 박제된' 작업을 풀어준다
+    (task_registry.reap_stale_tasks 참조). 박제가 풀리면 (1)산출물이 release→reflow로 공개·자동배포되고
+    (2)사회자가 더는 '작업 중'으로 오인하지 않아 다음 작업으로 진행할 수 있다. 한 공간 실패가 다른 공간을
+    막지 않게 공간별로 가둔다. 신선 heartbeat(살아 일하는) 작업은 reap_stale_tasks가 절대 건드리지 않는다."""
+    results: list[dict] = []
+    if not SPACES.exists():
+        return results
+    for space_dir in sorted(SPACES.iterdir()):
+        if not space_dir.is_dir():
+            continue
+        if not (space_dir / MANAGER_DIRNAME).exists():
+            continue
+        try:
+            reaped = task_registry.reap_stale_tasks(space_dir.name)
+            if reaped:
+                results.extend(reaped)
+        except Exception:
+            # reap_stale_tasks는 예외안전이지만, 한 공간 실패가 다른 공간 복구를 막지 않게 이중 방어.
+            pass
+        # 원장 압축 백스톱 — finalize 시점 압축을 놓친 방(서버 재시작·기존 원장 마이그레이션)을 회수.
+        # compact 자체가 임계 미만이면 no-op·예외안전이라 30초 주기에 얹어도 무해하다.
+        task_registry.compact_closed_task_events(space_dir.name)
     return results
 
 
@@ -5087,6 +5940,7 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
     error = ""
     manager_failed = False
     manager_engine_failed = False
+    engine_retry_used = False
     for attempt in range(1, MAX_DECISION_ATTEMPTS + 1):
         _write_state(
             space, "manager_running", event=event, actor="공간관리",
@@ -5118,7 +5972,29 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
                 decision = _normalize_decision(space, _extract_decision_json(raw), member_tokens)
                 error = _decision_error(decision, member_tokens)
         attempts.append({"attempt": attempt, "raw": raw, "decision": decision, "error": error})
-        if manager_failed or not error:
+        if not manager_failed and not error:
+            break
+        if manager_failed:
+            # 엔진 일시 실패(타임아웃/모델 오류)는 1회 재시도한다. 종전엔 첫 실패에서 즉시 포기해
+            # 그 tick이 통째로 죽었다(실증 레빗_bcd7: 매니저 타임아웃 2연속 → 대표 응답 22분 지연).
+            # JSON 형식 재시도(아래)와 별개로, 엔진 레벨 실패에도 최소 한 번의 기회를 준다.
+            if attempt < MAX_DECISION_ATTEMPTS and not engine_retry_used:
+                engine_retry_used = True
+                manager_failed = False
+                manager_engine_failed = False
+                error = ""
+                _write_state(
+                    space, "manager_retrying", event=event, actor="공간관리",
+                    label=f"엔진 실패 · 재시도 ({attempt + 1}/{MAX_DECISION_ATTEMPTS})",
+                    reason=str(raw)[:200],
+                    context_pack_id=manager_context_pack.get("context_pack_id", ""),
+                    wake_pack_manifest_id=manager_pack_manifest.get("manifest_id", ""),
+                    **_context_fields(context),
+                    **_coalesced_fields(context),
+                    **_claim_fields(claim),
+                )
+                prompt = base_prompt
+                continue
             break
         if attempt < MAX_DECISION_ATTEMPTS:
             next_attempt = attempt + 1
@@ -5740,6 +6616,25 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
                     **_claim_fields(claim),
                 })
                 events.append({"type": "candidate_discarded", "candidate_ids": candidate_ids, "count": len(discarded.get("events") or [])})
+                # 폐기로 그 대표 입력의 후보가 하나도 안 남으면, parallel_pass 진입 때 assigned로 잡아둔
+                # 응답의무를 open으로 되돌린다. 안 되돌리면 발행할 후보도 없고 sweep(open 전용)도 못 잡아
+                # 대표 입력이 영구 무응답이 된다(감사 확정 경로). 이미 답이 나간 의무는 terminal이라 no-op.
+                for candidate in candidates:
+                    cand_context = _candidate_context(candidate)
+                    turn = str((candidate or {}).get("turn_id") or "")
+                    try:
+                        remaining = candidate_queue.pending_ids_for_turn(space, turn) if turn else []
+                    except Exception:
+                        remaining = []
+                    if not remaining:
+                        _safe_obligation(
+                            space,
+                            "reopen_after_discard_all_candidates",
+                            lambda ctx=cand_context: response_obligation.reopen_for_context(
+                                space, ctx, actor="공간관리",
+                                reason="후보 전량 폐기 — 대표 입력 응답의무 재개",
+                            ),
+                        )
                 _write_state(space, "idle", last_action="discard_candidate", label="병렬 후보 폐기",
                              reason=decision.get("reason", ""), **_context_fields(context), **_claim_fields(claim))
         except Exception as exc:
@@ -5764,6 +6659,68 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
             space, context or {}, outcome="answered", actor="공간관리",
             reason="방지침에 규칙 기록", responder="공간관리"))
         _write_state(space, "idle", last_action="update_guide", label="방지침 기록",
+                     read_until_event_seq=transcript_state(space).get("last_event_seq"),
+                     **_context_fields(context), **_claim_fields(claim))
+    elif action == "update_summary":
+        # 롤링 누적요약: 요약.md를 갱신된 전문으로 대체(방에 공개 안 함·응답의무 안 닫음 — 내부 누적기록).
+        # 갱신 후 auto-continue로 본 턴(대표 발언 등)을 이어서 처리한다.
+        summary = message or str(decision.get("reason") or "").strip()
+        res = _write_rolling_summary(space, summary)
+        _append_activity(space, {
+            "상태": "summary_updated" if res.get("written") else "summary_update_noop",
+            "시각": now_iso(), "actor": "공간관리", "target": "요약",
+            "label": "롤링 누적요약 갱신" if res.get("written") else "요약 갱신 생략(빈값)",
+            "detail": str(summary)[:160],
+            **_context_fields(context), **_claim_fields(claim),
+        })
+        events.append({"type": "summary_updated", "written": bool(res.get("written")), "char_count": res.get("char_count", 0)})
+        _write_state(space, "idle", last_action="update_summary", label="롤링 누적요약 갱신",
+                     read_until_event_seq=transcript_state(space).get("last_event_seq"),
+                     **_context_fields(context), **_claim_fields(claim))
+    elif action == "launch_app":
+        # 인가된 앱 실행: 샌드박스 에이전트가 못 하는 외부효과(앱 실행)를 시스템이 대행한다.
+        # 등록 앱(앱 탭)만 — run_app은 매니페스트의 run만 그 target에서 실행(임의 명령 차단)하고 pidfile을
+        # 기록해 대시보드 앱 탭에 '● 실행 중'으로 반영한다.
+        app_ref = str(decision.get("app") or message or "").strip()
+        launch_ok = False
+        info = _resolve_app(app_ref)
+        if not info:
+            note = f"⚠️ '{app_ref}' 앱을 앱 탭(레지스트리)에서 못 찾았어요. 등록된 앱 이름인지 확인이 필요해요."
+        else:
+            try:
+                from . import apps as core_apps
+                res = core_apps.run_app(info["dir"])
+                launch_ok = bool(res.get("running") or res.get("ok"))
+                if res.get("already"):
+                    _insts = res.get("instances") or []
+                    if res.get("detected_external") and _insts:
+                        # 대시보드 밖에서 이미 켜져 있던 인스턴스 감지 → 중복 실행 안 함, PID들 보고(에이전트 타깃팅용).
+                        _pid_lines = "; ".join(
+                            f"PID {i.get('pid')}" + (f"({str(i.get('title'))[:36]})" if i.get('title') else "")
+                            for i in _insts)
+                        note = (f"📌 '{info['name']}'은 이미 실행 중이라 또 띄우지 않았어요 — 실행 중 인스턴스 "
+                                f"{res.get('instance_count', len(_insts))}개: {_pid_lines}. 특정 인스턴스로 작업하려면 그 PID를 대상으로 지시하세요.")
+                    else:
+                        note = f"📌 '{info['name']}'은 이미 실행 중이에요 (앱 탭 '● 실행 중', pid {res.get('pid')})."
+                else:
+                    note = f"📌 '{info['name']}'을 실행했어요 — 앱 탭에 '● 실행 중'으로 떠요(대시보드 반영). pid {res.get('pid')}."
+            except Exception as exc:
+                note = f"⚠️ '{(info or {}).get('name', app_ref)}' 실행에 실패했어요: {_public_error_summary(exc)}"
+        _append_activity(space, {
+            "상태": "app_launched" if launch_ok else "app_launch_failed",
+            "시각": now_iso(), "actor": "공간관리", "target": (info or {}).get("dir", app_ref),
+            "label": "앱 실행(대시보드 반영)" if launch_ok else "앱 실행 실패",
+            "detail": str(note)[:160], **_context_fields(context), **_claim_fields(claim),
+        })
+        events.append({"type": "app_launched", "ok": launch_ok, "app": app_ref, "dir": (info or {}).get("dir", "")})
+        _publish_manager_note(space, note, context, claim)
+        # 앱 실행은 '요청의 전부'가 아니라 대개 '작업의 전제'다(예: "revit을 실행해서 거기서 작업하려고
+        # 팀을 구성하자"). 그래서 launch_app을 여기서 응답의무 answered로 '종결'하지 않는다 — 종결하면
+        # 복합요청(실행+팀구성+방지침+조작)의 나머지가 방치돼 방이 idle+answered로 스트랜드된다(어떤
+        # 백스톱도 idle 방은 안 잡는다). 대신 성공 시 _should_auto_continue가 본 턴을 한 번 더 이어
+        # 매니저가 남은 요청을 처리(pass로 담당자 위임/방지침 update_guide 등)하게 한다. 단순 실행이면
+        # 이어진 턴에서 매니저가 stop을 택해 그 경로가 의무를 manager_closed로 닫는다(회귀안전).
+        _write_state(space, "idle", last_action="launch_app", label="앱 실행" if launch_ok else "앱 실행 실패",
                      read_until_event_seq=transcript_state(space).get("last_event_seq"),
                      **_context_fields(context), **_claim_fields(claim))
     elif action == "propose_knowledge":
@@ -6136,6 +7093,20 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
                 )
         finally:
             executor.shutdown(wait=join_policy == "wait_all", cancel_futures=True)
+        if not candidate_results:
+            # 후보 전원 실패/타임아웃 — 이 턴은 assigned 로 잡아둔 응답의무를 되돌려야 한다.
+            # 안 되돌리면 pending 후보 0 이라 candidate drain 도, open 전용 sweep 도 못 잡아
+            # 대표 입력이 영구 무응답으로 스트랜드된다(감사 확정 경로).
+            _safe_obligation(
+                space,
+                "reopen_after_all_candidates_failed",
+                lambda: response_obligation.reopen_for_context(
+                    space,
+                    context,
+                    actor="공간관리",
+                    reason=f"parallel_pass 후보 {len(specs)}명 전원 실패/타임아웃 — 의무 재개",
+                ),
+            )
         orchestration.append_effect(space, {
             "effect_id": orchestration.effect_id(
                 "parallel_pass",
@@ -6224,25 +7195,40 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
                          turn_handoff_id=turn_handoff_pack.get("turn_handoff_id", ""),
                          wake_pack_manifest_id=agent_pack_manifest.get("manifest_id", ""),
                          **_context_fields(context), **_claim_fields(claim))
-            reply = _run_agent_turn(
-                space,
-                wake,
-                message,
-                claim,
-                context,
-                handoff_context_pack=agent_context_pack,
-                turn_handoff_pack=turn_handoff_pack,
-                reason=decision.get("reason", ""),
-            )
-            events.append({
-                "type": "wake",
-                "person": wake,
-                "message": message,
-                "reply": reply,
-                "context_pack_id": agent_context_pack.get("context_pack_id", ""),
-                "wake_id": turn_handoff_pack.get("wake_id", ""),
-                "turn_handoff_id": turn_handoff_pack.get("turn_handoff_id", ""),
-            })
+            dispatched_async = _dispatch_chat_turn(space, wake=wake, message=message, context=context,
+                                                   reason=decision.get("reason", ""))
+            if dispatched_async:
+                # 턴은 백그라운드에서 돈다 — 이 tick은 여기서 끝나 claim이 곧 풀리고, 그동안 도착하는
+                # 대표 메시지는 claim_busy 없이 정상 처리된다(티키타카 비차단). 응답 공개·대화 연속은
+                # 자식이 publish_ready_chat_candidates + tick으로 잇는다.
+                events.append({
+                    "type": "chat_turn_dispatched",
+                    "person": wake,
+                    "message": message,
+                    "context_pack_id": agent_context_pack.get("context_pack_id", ""),
+                    "wake_id": turn_handoff_pack.get("wake_id", ""),
+                    "turn_handoff_id": turn_handoff_pack.get("turn_handoff_id", ""),
+                })
+            else:
+                reply = _run_agent_turn(
+                    space,
+                    wake,
+                    message,
+                    claim,
+                    context,
+                    handoff_context_pack=agent_context_pack,
+                    turn_handoff_pack=turn_handoff_pack,
+                    reason=decision.get("reason", ""),
+                )
+                events.append({
+                    "type": "wake",
+                    "person": wake,
+                    "message": message,
+                    "reply": reply,
+                    "context_pack_id": agent_context_pack.get("context_pack_id", ""),
+                    "wake_id": turn_handoff_pack.get("wake_id", ""),
+                    "turn_handoff_id": turn_handoff_pack.get("turn_handoff_id", ""),
+                })
         except Exception as exc:
             if isinstance(exc, StaleManagerClaim) or _is_stale_publish_error(exc):
                 _release, release_events = _release_redrive(space, claim, "stale_agent_reply")
@@ -6327,6 +7313,17 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
                 **_claim_fields(claim),
             })
             events.append({"type": "wake_failed", "person": wake, "message": message, "error": err})
+            # 지목 에이전트 턴이 실패했다 = 아직 대표에게 답이 안 나갔다. pass 실행 전에 'assigned'로 전이해
+            # 둔 응답의무를 다시 'open'으로 되돌려, 미응답 sweep(_open_user_obligations는 open만 재구동)이
+            # 재구동해 자가치유하게 한다. 안 그러면 의무가 'assigned'로 고아가 돼 대표 메시지가 영영 무응답·
+            # 무재시도로 스트랜드된다(manager_failure가 의무를 open으로 유지하는 것과 대칭). 종결된 의무는 no-op.
+            _safe_obligation(
+                space,
+                "reopen_after_wake_failed",
+                lambda: response_obligation.reopen_for_context(
+                    space, context, actor="공간관리", reason=f"wake_failed 재구동: {err[:200]}",
+                ),
+            )
             # 타임아웃류 wake 실패는 자기성장 루프로 케이스화한다(중복기동 방지 교훈 → 스킬 승격 후보).
             # 그 외 실패(모델/멤버/스키마 등)는 종전대로 수동검토 보류로 둔다 — 회귀 최소화.
             _err_l = err.lower()
@@ -6378,21 +7375,27 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
                          turn_handoff_id=turn_handoff_pack.get("turn_handoff_id", ""),
                          **_context_fields(context), **_claim_fields(claim))
         else:
-            _append_activity(space, {
-                "상태": "agent_replied", "시각": now_iso(), "actor": wake,
-                "label": f"{wake} 응답 기록", "detail": str(reply)[:120],
-                "context_pack_id": agent_context_pack.get("context_pack_id", ""),
-                "wake_id": turn_handoff_pack.get("wake_id", ""),
-                "turn_handoff_id": turn_handoff_pack.get("turn_handoff_id", ""),
-                **_context_fields(context),
-                **_claim_fields(claim),
-            })
-            _write_state(space, "idle", last_action="pass", last_target=wake, label=f"{wake} 응답 완료",
-                         read_until_event_seq=transcript_state(space).get("last_event_seq"),
-                         context_pack_id=agent_context_pack.get("context_pack_id", ""),
-                         wake_id=turn_handoff_pack.get("wake_id", ""),
-                         turn_handoff_id=turn_handoff_pack.get("turn_handoff_id", ""),
-                         **_context_fields(context), **_claim_fields(claim))
+            if dispatched_async:
+                # detached 경로 — reply는 아직 없다(자식이 생성 중). 상태는 agent_running을 유지하고
+                # 공개·idle 전환은 publish_ready_chat_candidates가 한다. (여기서 reply를 참조하면
+                # UnboundLocalError로 tick이 죽고 claim이 고아가 된다 — e2e 실증 후 수정.)
+                pass
+            else:
+                _append_activity(space, {
+                    "상태": "agent_replied", "시각": now_iso(), "actor": wake,
+                    "label": f"{wake} 응답 기록", "detail": str(reply)[:120],
+                    "context_pack_id": agent_context_pack.get("context_pack_id", ""),
+                    "wake_id": turn_handoff_pack.get("wake_id", ""),
+                    "turn_handoff_id": turn_handoff_pack.get("turn_handoff_id", ""),
+                    **_context_fields(context),
+                    **_claim_fields(claim),
+                })
+                _write_state(space, "idle", last_action="pass", last_target=wake, label=f"{wake} 응답 완료",
+                             read_until_event_seq=transcript_state(space).get("last_event_seq"),
+                             context_pack_id=agent_context_pack.get("context_pack_id", ""),
+                             wake_id=turn_handoff_pack.get("wake_id", ""),
+                             turn_handoff_id=turn_handoff_pack.get("turn_handoff_id", ""),
+                             **_context_fields(context), **_claim_fields(claim))
     elif wake:
         events.append({"type": "wake_skipped", "person": wake, "reason": "멤버 토큰이 아니거나 메시지가 비었음"})
         _write_state(space, "idle", last_action="wake_skipped", last_target=wake,
