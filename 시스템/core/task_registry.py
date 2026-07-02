@@ -2028,6 +2028,16 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
         except Exception as exc:
             verification = {"status": "not_run", "not_run_reason": f"objective verify 실패: {str(exc)[:120]}"}
         raw_status["verification"] = verification   # _release_request가 같은 검증을 싣도록 전파
+    # P4(2) 이종 검토자: 검토 권고(suspect/고위험)면 원장에 기록(섀도 — 공개는 D0대로 막지 않음).
+    # 실제 검토자 디스패치·차단은 CNV_REVIEW_DISPATCH_ACTIVE / CNV_REVIEW_BLOCK_ACTIVE 플래그일 때만.
+    try:
+        from . import reviewer
+        if reviewer.should_review(verification):
+            doer_engine = str((task_pack.get("runtime") or {}).get("engine")
+                              or (previous_work_status or {}).get("engine") or "claude")
+            reviewer.record_review_intent(space, task_id, verification, doer_engine=doer_engine)
+    except Exception:
+        pass
     release_request = {}
     release_enqueue = {}
     # error(엔진 타임아웃 등)도 포함 — 완료/부분 산출이 조용히 사라지지 않고 방에 surface되게 한다.
