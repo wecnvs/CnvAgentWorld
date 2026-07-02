@@ -1274,6 +1274,12 @@ def read_approval_required(space: str) -> dict:
 # 작업 디스패치 정책 (설계_대화작업분리 Phase A/E)
 WORK_DISPATCH_ASYNC = True          # 킬스위치: False면 항상 인라인 동기(구 동작)
 MAX_IN_FLIGHT_TASKS = 3             # 방별 동시 실행 작업 상한(폭주·비용 억제, 9.2)
+# 작업/채팅 러너를 새 세션(start_new_session)으로 분리할지. **기본 False** — macOS에서 분리하면
+# 터미널의 화면녹화/손쉬운사용 권한(TCC) 상속이 끊겨 에이전트가 화면을 못 봐 CU가 통째로 헛돈다
+# (근본진단 2026-07-02: 관리기록/디버깅/2026-07-02_작업에이전트_CU_화면녹화권한_상속단절.md).
+# 분리 안 하면 러너는 서버(터미널) 세션에 남아 권한을 상속한다. '서버 죽어도 완주'는 자동재개(resume)·
+# reaper로 보완. 비-CU/헤드리스 환경에서 옛 동작이 필요하면 CNV_WORK_DETACH=1로 되돌린다.
+_WORK_DISPATCH_NEW_SESSION = os.environ.get("CNV_WORK_DETACH", "") == "1"
 
 # ── 채팅 턴 디스패치 정책 (설계_대화작업분리 §9.3 갭1 해소 — 티키타카 비동기화) ──
 # 종전엔 단일 pass 채팅 턴이 manager claim을 쥔 채 engine.run_engine(≥300s)을 동기 실행해,
@@ -1349,7 +1355,7 @@ def _dispatch_chat_turn(space: str, *, wake: str, message: str, context: dict | 
     try:
         proc = subprocess.Popen(
             [sys.executable, "-m", "core.run_chat_turn", str(dfile)],
-            cwd=str(SYS), start_new_session=True,
+            cwd=str(SYS), start_new_session=_WORK_DISPATCH_NEW_SESSION,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
     except Exception:
@@ -1620,7 +1626,7 @@ def _dispatch_work_plan(
     try:
         proc = subprocess.Popen(
             [sys.executable, "-m", "core.run_work", str(dfile)],
-            cwd=str(SYS), start_new_session=True,
+            cwd=str(SYS), start_new_session=_WORK_DISPATCH_NEW_SESSION,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
     except Exception:

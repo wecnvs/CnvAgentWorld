@@ -65,7 +65,7 @@ class DispatchTest(unittest.TestCase):
         popen.assert_called_once()
         cmd = popen.call_args[0][0]
         self.assertIn("core.run_work", cmd)                 # detached 러너 호출
-        self.assertTrue(popen.call_args[1].get("start_new_session"))  # 세션 분리
+        self.assertFalse(popen.call_args[1].get("start_new_session"))  # 기본 미분리(TCC 상속 유지, 2026-07-02)
         self.assertIn("디스패치됨", msg)
         dfile = SPACES / self.space / "dispatch" / f"{pid}.json"
         self.assertTrue(dfile.exists())

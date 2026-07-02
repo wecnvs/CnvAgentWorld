@@ -52,7 +52,7 @@ class ChatDispatchTest(unittest.TestCase):
         popen.assert_called_once()
         cmd = popen.call_args[0][0]
         self.assertIn("core.run_chat_turn", cmd)
-        self.assertTrue(popen.call_args[1].get("start_new_session"))
+        self.assertFalse(popen.call_args[1].get("start_new_session"))  # 기본 미분리(TCC 상속 유지, 2026-07-02)
         files = list((SPACES / self.space / "dispatch_chat").glob("*.json"))
         self.assertEqual(len(files), 1)
         data = json.loads(files[0].read_text(encoding="utf-8"))

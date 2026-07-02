@@ -101,5 +101,90 @@ class GrowthJanitorTests(unittest.TestCase):
         self.assertIn("sweep_summary", kinds)
 
 
+class ReviewProvisionalMustTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._run = gj._RUN_DIR; self._log = gj._LOG; self._stamp = gj._STAMP
+        gj._RUN_DIR = self.tmp / ".run"; gj._LOG = gj._RUN_DIR / "gj.jsonl"; gj._STAMP = gj._RUN_DIR / "gj.stamp"
+        self.sdir = self.tmp / "skills" / "S"; self.sdir.mkdir(parents=True)
+        (self.sdir / "cases.jsonl").write_text("", encoding="utf-8")
+        self._ol = skill_smith.list_skills; self._od = case_ledger.skill_dir
+        skill_smith.list_skills = lambda: [{"name": "S"}]
+        case_ledger.skill_dir = lambda name: self.sdir if name == "S" else None
+        import core.injection_log as il
+        self._il = il; self._ilsp = il.SPACES; il.SPACES = self.tmp / "spaces"; (self.tmp / "spaces").mkdir()
+        os.environ.pop("CNV_JANITOR_DISABLE", None); os.environ.pop("CNV_REVIEW_ACTIVE", None)
+
+    def tearDown(self):
+        gj._RUN_DIR, gj._LOG, gj._STAMP = self._run, self._log, self._stamp
+        skill_smith.list_skills = self._ol; case_ledger.skill_dir = self._od
+        self._il.SPACES = self._ilsp
+        os.environ.pop("CNV_REVIEW_ACTIVE", None)
+        import shutil; shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pm_case(self, cid, created):
+        rec = {"case_id": cid, "skill_id": "s", "status": "provisional_must", "polarity": "worked",
+               "condition": "c", "instruction": "i", "must_apply": True, "created_at": created}
+        with (self.sdir / "cases.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def test_recent_pm_not_reviewed(self):
+        # 창(7일) 이전이 아니면 재판정 대상 아님
+        self._pm_case("cNew", datetime.now().isoformat(timespec="seconds"))
+        r = gj.review_provisional_must()
+        self.assertEqual(r["confirmed"], []); self.assertEqual(r["unconfirmed"], [])
+
+    def test_converged_worked_confirms_shadow_then_active(self):
+        # worked 수렴(독립 확인자 2명, harmful 0) → 섀도 would_confirm → 플래그 시 worked_threshold로 active
+        old = (datetime.now() - timedelta(days=10)).isoformat(timespec="seconds")
+        # proposed_by=대표, 확인자 a1·a2(독립) — worked_threshold 게이트 통과 조건
+        rec = {"case_id": "cW", "skill_id": "s", "status": "provisional_must", "polarity": "worked",
+               "condition": "c", "instruction": "i", "must_apply": True, "proposed_by": "대표", "created_at": old}
+        with (self.sdir / "cases.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        case_ledger.record_case_event(self.sdir, "cW", "worked", by="a1", rationale="ok")
+        case_ledger.record_case_event(self.sdir, "cW", "worked", by="a2", rationale="ok")
+        # 섀도: would_confirm만, 상태 유지
+        r = gj.review_provisional_must()
+        self.assertIn("cW", r["confirmed"]); self.assertTrue(r["shadow"])
+        st = {c["case_id"]: c["status"] for c in case_ledger.read_cases(self.sdir)}
+        self.assertEqual(st["cW"], "provisional_must")
+        # 플래그: worked_threshold 게이트 통과해 active
+        os.environ["CNV_REVIEW_ACTIVE"] = "1"
+        gj.review_provisional_must()
+        st = {c["case_id"]: c["status"] for c in case_ledger.read_cases(self.sdir)}
+        self.assertEqual(st["cW"], "active")
+
+    def test_single_selfreport_does_not_confirm_under_flag(self):
+        # 단일 자기보고(worked 1)는 worked_threshold 미달 → 플래그 켜도 승격 안 됨(과승격 방지)
+        old = (datetime.now() - timedelta(days=10)).isoformat(timespec="seconds")
+        self._pm_case("cS", old)
+        case_ledger.record_case_event(self.sdir, "cS", "worked", by="solo", rationale="ok")
+        os.environ["CNV_REVIEW_ACTIVE"] = "1"
+        gj.review_provisional_must()
+        st = {c["case_id"]: c["status"] for c in case_ledger.read_cases(self.sdir)}
+        self.assertEqual(st["cS"], "provisional_must")   # 게이트 미달 → 유지
+
+    def test_unconfirmed_never_demoted_even_under_flag(self):
+        # 대표 지시(provisional_must)는 worked 없어도 강등되지 않는다(약한 신호로 안 죽임) — 플래그 켜도 유지
+        old = (datetime.now() - timedelta(days=10)).isoformat(timespec="seconds")
+        self._pm_case("cU", old)
+        self._il.record_injection("방1", kind="work", ref="t1",
+                                  injected=[{"skill": "S", "case_id": "cU", "kind": "preview"}])
+        os.environ["CNV_REVIEW_ACTIVE"] = "1"
+        r = gj.review_provisional_must()
+        self.assertIn("cU", r["unconfirmed"])
+        st = {c["case_id"]: c["status"] for c in case_ledger.read_cases(self.sdir)}
+        self.assertEqual(st["cU"], "provisional_must")   # 강등 없음(대표 지시 보존)
+
+    def test_never_exposed_kept(self):
+        old = (datetime.now() - timedelta(days=10)).isoformat(timespec="seconds")
+        self._pm_case("cNever", old)   # worked 0, 노출 0 → 유지(미확인 surfacing, 강등 없음)
+        r = gj.review_provisional_must()
+        self.assertNotIn("cNever", r["confirmed"])
+        st = {c["case_id"]: c["status"] for c in case_ledger.read_cases(self.sdir)}
+        self.assertEqual(st["cNever"], "provisional_must")
+
+
 if __name__ == "__main__":
     unittest.main()

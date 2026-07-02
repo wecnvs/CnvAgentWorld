@@ -104,9 +104,72 @@ def _to_jpeg(raw: bytes, max_width: int, quality: int):
         return raw, "image/png"
 
 
+# 서버 내부 직접 캡처(고속 경로) 캐시 — 프레임마다 subprocess/PIL-import/PNG-디스크를 없앤다.
+# 종전: 프레임당 screenshot.py subprocess + Quartz + PNG저장 + 재읽기 + PNG디코드 + JPEG재인코딩(수백 ms→~2-5fps).
+# 개선: 서버(8686, 화면녹화 권한 상속) 프로세스 안에서 Quartz 캡처→리사이즈→JPEG 한 번에(~15-30fps 목표).
+_FAST = {"ok": None, "Quartz": None, "Image": None, "ImageDraw": None}
+
+
+def _fast_mods():
+    if _FAST["ok"] is None:
+        try:
+            import Quartz                                   # noqa
+            from PIL import Image, ImageDraw               # noqa
+            _FAST.update(ok=True, Quartz=Quartz, Image=Image, ImageDraw=ImageDraw)
+        except Exception:
+            _FAST["ok"] = False
+    return _FAST["ok"]
+
+
+def _local_screenshot_fast(max_width: int, quality: int):
+    """macOS 서버 내부 Quartz 직접 캡처→JPEG(+커서 마커). 실패 시 예외 → 호출부가 subprocess로 폴백."""
+    if IS_WIN or not _fast_mods():
+        raise RuntimeError("fast capture 미지원(Windows 또는 Quartz/PIL 없음)")
+    Q = _FAST["Quartz"]; Image = _FAST["Image"]; ImageDraw = _FAST["ImageDraw"]
+    from io import BytesIO
+    cgimg = Q.CGWindowListCreateImage(
+        Q.CGRectInfinite, Q.kCGWindowListOptionOnScreenOnly, Q.kCGNullWindowID, Q.kCGWindowImageDefault)
+    if cgimg is None:
+        raise RuntimeError("CGWindowListCreateImage None(화면녹화 권한 없음?)")
+    pw = Q.CGImageGetWidth(cgimg); ph = Q.CGImageGetHeight(cgimg)
+    provider = Q.CGImageGetDataProvider(cgimg)
+    raw = Q.CGDataProviderCopyData(provider)
+    bpr = Q.CGImageGetBytesPerRow(cgimg)
+    im = Image.frombuffer("RGBA", (pw, ph), bytes(raw), "raw", "BGRA", bpr, 1).convert("RGB")
+    # 논리 화면 크기(커서 좌표계) — 물리(레티나) 대비 스케일 계산용
+    try:
+        bounds = Q.CGDisplayBounds(Q.CGMainDisplayID())
+        lw = int(bounds.size.width); lh = int(bounds.size.height)
+    except Exception:
+        lw, lh = pw, ph
+    # 출력 리사이즈(가로 max_width)
+    ow, oh = im.size
+    if max_width and ow > max_width:
+        oh = max(1, round(oh * max_width / ow)); ow = max_width
+        im = im.resize((ow, oh), Image.BILINEAR)
+    # 커서 마커(하드웨어 커서는 캡처에 안 찍히므로 직접 그림 — 그리드에서 커서 위치가 보이게)
+    try:
+        loc = Q.CGEventGetLocation(Q.CGEventCreate(None))
+        cx = int(loc.x * ow / max(1, lw)); cy = int(loc.y * oh / max(1, lh))
+        d = ImageDraw.Draw(im)
+        r = 9
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(255, 0, 0), width=3)
+        d.line([cx - r - 4, cy, cx + r + 4, cy], fill=(255, 0, 0), width=1)
+        d.line([cx, cy - r - 4, cx, cy + r + 4], fill=(255, 0, 0), width=1)
+    except Exception:
+        pass
+    buf = BytesIO()
+    im.save(buf, format="JPEG", quality=max(30, min(95, int(quality))))
+    return buf.getvalue(), "image/jpeg"
+
+
 def _local_screenshot(max_width: int, quality: int):
-    raw, _w, _h, _cur = _local_capture(with_cursor=True)
-    return _to_jpeg(raw, max_width, quality)
+    # 고속 경로 우선, 실패 시 기존 subprocess 경로로 폴백(무회귀).
+    try:
+        return _local_screenshot_fast(max_width, quality)
+    except Exception:
+        raw, _w, _h, _cur = _local_capture(with_cursor=True)
+        return _to_jpeg(raw, max_width, quality)
 
 
 def _local_view_status() -> dict:

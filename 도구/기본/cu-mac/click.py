@@ -9,9 +9,12 @@ import subprocess
 import time
 from pathlib import Path
 
+TOOLS_DIR = Path(__file__).parent
+sys.path.insert(0, str(TOOLS_DIR))
+import _glide
+
 CLICLICK = "/opt/homebrew/bin/cliclick"
 PYTHON    = "/opt/homebrew/bin/python3.13"
-TOOLS_DIR = Path(__file__).parent
 
 def _hud(msg: str):
     try:
@@ -28,11 +31,10 @@ parser.add_argument("y", type=int)
 parser.add_argument("--double",   action="store_true")
 parser.add_argument("--right",    action="store_true")
 parser.add_argument("--middle",   action="store_true")
-parser.add_argument("--duration", type=float, default=0.4)
+# 기본 1.0초 — 원격 그리드(≈5fps)에서 커서가 사람처럼 목표까지 스르륵 이동해 클릭하는 게 보이게.
+# 빠른 무관전 조작이 필요하면 호출부가 --duration 을 낮춘다.
+parser.add_argument("--duration", type=float, default=_glide.DEFAULT_DURATION)
 args = parser.parse_args()
-
-# easing: duration 0.4 → easing 5 (자연스러운 이동)
-easing = max(2, int(args.duration * 12))
 
 if args.double:
     click_cmd = f"dc:{args.x},{args.y}"
@@ -57,14 +59,13 @@ subprocess.Popen(
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
 )
 
-# 이동 → 잠깐 대기 → 클릭
-subprocess.run([
-    CLICLICK,
-    "-e", str(easing),
-    f"m:{args.x},{args.y}",
-    "w:120",
-    click_cmd,
-])
+# 사람처럼 보간 이동 → 잠깐 대기 → 클릭 (한 cliclick 호출로 원자적 — move 후 드리프트 없음)
+toks = _glide.glide_tokens(args.x, args.y, args.duration)
+if _glide.is_fallback(toks):
+    subprocess.run([CLICLICK, "-e", str(_glide.fallback_easing(args.duration)),
+                    f"m:{args.x},{args.y}", "w:120", click_cmd])
+else:
+    subprocess.run([CLICLICK] + toks + ["w:120", click_cmd])
 
 _hud(label)
 print(f"clicked ({args.x}, {args.y})")

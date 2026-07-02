@@ -8,8 +8,12 @@
 """
 import argparse
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import _glide
 
 CLICLICK = "/opt/homebrew/bin/cliclick"
 
@@ -27,10 +31,15 @@ def _hud(msg: str):
 parser = argparse.ArgumentParser()
 parser.add_argument("x", type=int)
 parser.add_argument("y", type=int)
-parser.add_argument("--duration", type=float, default=0.4)
+# 기본 1.0초 — 원격 그리드(≈5fps)에서 사람처럼 스르륵 보이게. 빠른 이동 필요시 --duration 낮춘다.
+parser.add_argument("--duration", type=float, default=_glide.DEFAULT_DURATION)
 args = parser.parse_args()
 
-easing = max(2, int(args.duration * 12))
-subprocess.run([CLICLICK, "-e", str(easing), f"m:{args.x},{args.y}"])
+# 현재 위치→목표를 명시 보간해 사람처럼 이동(그리드에 보이게). 위치 못 읽으면 내장 easing 폴백.
+toks = _glide.glide_tokens(args.x, args.y, args.duration)
+if _glide.is_fallback(toks):
+    subprocess.run([CLICLICK, "-e", str(_glide.fallback_easing(args.duration))] + toks)
+else:
+    subprocess.run([CLICLICK] + toks)
 _hud(f"➡️  포인터 이동 ({args.x}, {args.y}) — 캡처로 확인 후 클릭")
 print(f"moved to ({args.x}, {args.y})")
