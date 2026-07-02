@@ -11,8 +11,9 @@
 
   사용(맥/관리자 쪽 래퍼가 scp로 이 스크립트+헬퍼+cred를 호스트 ASCII 임시경로에 올린 뒤):
     powershell -NoProfile -ExecutionPolicy Bypass -File recover_vm.ps1 `
-       -VMName BB-Win11-2 -CredFile C:\Users\Public\bbc.json -HelperSrc C:\Users\Public\cu_helper.ps1 `
-       -Port 8599 -HostTail REDACTED_HOST_TAIL -ProxyPort 8602
+       -VMName <VM_NAME> -CredFile C:\Users\Public\<cred>.json -HelperSrc C:\Users\Public\cu_helper.ps1 `
+       -Port <PORT> -HostTail <HOST_TAIL> -ProxyPort <PROXY_PORT>
+  (실 값 host/IP·VM명·포트는 자산/대외비 targets에서 읽는다 — 배포 스크립트에 하드코딩 금지, law §7.)
   CredFile = vm_credentials.json 형식({accounts:[{user|username|name, password|pass|pwd}]}).
   실행 후 호출자가 CredFile(대외비)을 반드시 삭제한다.
 #>

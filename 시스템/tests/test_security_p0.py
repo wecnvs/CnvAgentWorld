@@ -141,7 +141,7 @@ class CasesRouterLocalLeakTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sdir = Path(tmp)
-            secret = "REDACTED_DUMMY_PII"
+            secret = "테스트가짜PII_XXX_000_0000"   # 실 PII 아님 — 유출 가드 검증용 더미(스캐너 오탐 방지)
             (sdir / "cases.jsonl").write_text(
                 json.dumps({"case_id": "pub1", "status": "active", "condition": "공개",
                             "instruction": "공개 지시", "polarity": "worked"}, ensure_ascii=False) + "\n",
