@@ -1,7 +1,7 @@
 // 공간 패널 렌더링과 동작(생성·입장).
-import { api } from "./api.js?v=20260629-30";
-import { clearSpaceChatIfCurrent, openSpaceChat } from "./room-chat.js?v=20260629-30";
-import { openPersonPickerModal, openRuntimeModal, openTextModal, openWorkSettingsModal } from "./people.js?v=20260629-30";
+import { api } from "./api.js?v=20260702-08";
+import { clearSpaceChatIfCurrent, openSpaceChat, refreshCurrentRoomParticipants } from "./room-chat.js?v=20260702-08";
+import { openPersonPickerModal, openRuntimeModal, openTextModal, openWorkSettingsModal } from "./people.js?v=20260702-08";
 
 let engineCatalog = null;
 
@@ -233,7 +233,7 @@ export function wireSpaces(refreshAll) {
       emptyText: "이 공간에 추가할 수 있는 에이전트가 없습니다.",
     });
     if (!person) return;
-    try { await api.join(person, space); await refreshAll(); }
+    try { await api.join(person, space); await refreshAll(); await refreshCurrentRoomParticipants(); }
     catch (e) { alert("실패: " + e.message); }
   };
 }

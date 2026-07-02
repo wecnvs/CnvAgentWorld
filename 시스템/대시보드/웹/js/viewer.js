@@ -1,7 +1,7 @@
 // 대시보드 4패널 레이아웃 접기/펴기와 패널 너비 조절만 책임진다.
 const LAYOUT_STORAGE_KEY = "cnv.dashboardLayoutCollapsed.v1";
 const LAYOUT_WIDTH_STORAGE_KEY = "cnv.dashboardLayoutFractions.v1";
-const SPLITTER_WIDTH = "7px";
+const SPLITTER_WIDTH = "10px";
 
 const panels = [
   { key: "agents", label: "에이전트", id: "people-panel", min: 150, fraction: 0.62 },
@@ -51,19 +51,28 @@ function visiblePanelKeys() {
     .filter((key) => !collapsedPanels.has(key));
 }
 
-function splitterBetween(leftKey, rightKey) {
-  return document.querySelector(`.workspace-splitter[data-splitter-left="${leftKey}"][data-splitter-right="${rightKey}"]`);
-}
-
 function updateSplitters(visibleKeys) {
-  const visible = new Set(visibleKeys);
+  const nextVisibleByLeft = new Map();
+  for (let i = 0; i < visibleKeys.length - 1; i += 1) {
+    nextVisibleByLeft.set(visibleKeys[i], visibleKeys[i + 1]);
+  }
+  const axis = window.matchMedia("(max-width: 720px)").matches ? "높이" : "너비";
   document.querySelectorAll(".workspace-splitter").forEach((splitter) => {
-    const left = splitter.dataset.splitterLeft;
-    const right = splitter.dataset.splitterRight;
-    const shown = visible.has(left) && visible.has(right);
-    splitter.dataset.hidden = shown ? "no" : "yes";
-    splitter.setAttribute("aria-hidden", shown ? "false" : "true");
-    splitter.tabIndex = shown ? 0 : -1;
+    const homeLeft = splitter.dataset.homeLeft || splitter.dataset.splitterLeft;
+    splitter.dataset.homeLeft = homeLeft;
+    const right = nextVisibleByLeft.get(homeLeft);
+    if (!right) {
+      splitter.dataset.hidden = "yes";
+      splitter.setAttribute("aria-hidden", "true");
+      splitter.tabIndex = -1;
+      return;
+    }
+    splitter.dataset.splitterLeft = homeLeft;
+    splitter.dataset.splitterRight = right;
+    splitter.dataset.hidden = "no";
+    splitter.setAttribute("aria-hidden", "false");
+    splitter.setAttribute("aria-label", `${panelByKey.get(homeLeft)?.label || homeLeft}와 ${panelByKey.get(right)?.label || right} 패널 ${axis} 조절`);
+    splitter.tabIndex = 0;
   });
 }
 
@@ -78,7 +87,7 @@ function applyLayoutPanels() {
   visibleKeys.forEach((key, index) => {
     columns.push(panelColumn(key));
     const nextKey = visibleKeys[index + 1];
-    if (nextKey && splitterBetween(key, nextKey)) columns.push(SPLITTER_WIDTH);
+    if (nextKey) columns.push(SPLITTER_WIDTH);
   });
   panels.forEach((panel) => {
     const collapsed = collapsedPanels.has(panel.key);

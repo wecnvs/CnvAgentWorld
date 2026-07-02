@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>감시 터미널</title>
+<!-- 8687이 self-host하는 xterm 재사용 (CDN 의존 없음) -->
+<link rel="stylesheet" href="/static/xterm.min.css">
+<script src="/static/xterm.min.js"></script>
+<script src="/static/xterm-addon-fit.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1117; color: #cdd6e3;
+    font-family: Menlo, Consolas, monospace; }
+  #wrap { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+  #term { flex: 1 1 auto; min-height: 0; padding: 6px 8px; }
+  #bar { flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; border-top: 1px solid #232a36; background: #11151c;
+    overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  #stat { font-size: 11px; color: #8a94a6; padding: 2px 6px; white-space: nowrap; }
+  #stat.ok { color: #58d68d; } #stat.bad { color: #e06c75; }
+  #bar .sp { flex: 1 1 auto; }
+  #bar button { background: #1b2230; color: #cdd6e3; border: 1px solid #2a3342;
+    border-radius: 6px; padding: 8px 12px; font-size: 13px; min-width: 44px; cursor: pointer; }
+  #bar button:active { background: #2a3342; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="term"></div>
+  <div id="bar">
+    <span id="stat">연결중…</span>
+    <span class="sp"></span>
+    <button data-key="up" title="위">↑</button>
+    <button data-key="down" title="아래">↓</button>
+    <button data-key="enter" title="Enter">⏎</button>
+    <button data-key="esc" title="Esc">Esc</button>
+    <button data-key="ctrlc" title="Ctrl-C">^C</button>
+  </div>
+</div>
+<script>
+(function () {
+  var KEYS = { up: "\x1b[A", down: "\x1b[B", enter: "\r", esc: "\x1b", ctrlc: "\x03" };
+  var sid = new URLSearchParams(location.search).get("sid");
+  var stat = document.getElementById("stat");
+  function setStat(t, cls) { stat.textContent = t; stat.className = cls || ""; }
+  if (!sid) { setStat("세션 ID 없음", "bad"); return; }
+  if (typeof Terminal === "undefined" || !(typeof FitAddon !== "undefined" && FitAddon.FitAddon)) {
+    setStat("xterm 로드 실패 — 새로고침", "bad"); return;
+  }
+
+  var term = new Terminal({
+    cursorBlink: true, fontSize: 13, fontFamily: "Menlo, Consolas, monospace",
+    convertEol: false, scrollback: 5000, theme: { background: "#0e1117" },
+  });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("term"));
+
+  var ws = null, retry = null;
+  var wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+
+  function doFit() {
+    try { fit.fit(); } catch (e) {}
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+    }
+  }
+  setTimeout(doFit, 60);
+  window.addEventListener("resize", doFit);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", doFit);
+    window.visualViewport.addEventListener("scroll", doFit);
+  }
+
+  function connect() {
+    setStat("연결중…", "");
+    ws = new WebSocket(wsBase + "/ws/" + sid);
+    ws.onopen = function () { setStat("연결됨", "ok"); setTimeout(doFit, 60); term.focus(); };
+    ws.onmessage = function (ev) {
+      var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === "output") term.write(m.data);
+      else if (m.type === "exit") { term.write("\r\n\x1b[33m[세션 종료됨]\x1b[0m\r\n"); setStat("종료됨", "bad"); }
+      else if (m.type === "error") { term.write("\r\n\x1b[31m[" + m.message + "]\x1b[0m\r\n"); }
+    };
+    ws.onclose = function () { setStat("재연결 대기…", ""); clearTimeout(retry); retry = setTimeout(connect, 1500); };
+    ws.onerror = function () { setStat("연결 오류", "bad"); };
+  }
+
+  term.onData(function (d) { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "input", data: d })); });
+  document.getElementById("bar").addEventListener("click", function (e) {
+    var b = e.target.closest("button"); if (!b) return;
+    var seq = KEYS[b.getAttribute("data-key")];
+    if (seq != null && ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "input", data: seq }));
+    term.focus();
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

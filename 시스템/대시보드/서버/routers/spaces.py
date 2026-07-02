@@ -6,6 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 import core.spaces as spaces
 import core.room_manager as room_manager
+import core.watch as watch
 from core import chat_policy
 from core import lesson_ledger
 
@@ -169,7 +170,15 @@ def messages(space: str, limit: int = 80):
 
 @router.get("/{space}/status")
 def status(space: str):
-    return room_manager.status(space)
+    st = room_manager.status(space)
+    # 감시 소견(상태칩 가시화)을 status에 얹는다 — 추가 폴링 없이 같은 주기로 전달(없으면 생략).
+    try:
+        report = watch.read_report(space)
+        if report and isinstance(st, dict):
+            st["watch_report"] = report
+    except Exception:
+        pass
+    return st
 
 
 @router.get("/{space}/handback")

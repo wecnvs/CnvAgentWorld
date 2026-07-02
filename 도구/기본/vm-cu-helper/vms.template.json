@@ -1,0 +1,22 @@
+{
+  "_schema": "VmRegistry.template.v1",
+  "_comment": "VM 레지스트리 '템플릿'(placeholder만). 호스트 에이전트가 각 VM의 CU 헬퍼에 접속하는 정보. name=CU락 target. ★실제 host/port·VM명은 대외비(타깃주소). 실제 값은 이 공개 파일에 적지 말고 `도구/대외비/vm-cu-helper/vms.json`(깃 미추적)에 두고 발견기로 참조한다 — vm_cu.py가 대외비→기본 순으로 레지스트리를 자동 탐색한다. 아래는 채워 넣을 자리만 보여주는 예시 스키마이며 실제 연결이 되지 않는다.",
+  "vms": [
+    {
+      "name": "<vm-alias>",
+      "vm_name": "<VM-COMPUTERNAME>",
+      "host": "<HOST_OR_TAILSCALE_IP — 대외비>",
+      "port": 8599,
+      "os": "windows",
+      "desc": "<이 VM 설명 — 자체 화면 CU 대상. 별칭은 항목을 여러 개 두면 됨>"
+    },
+    {
+      "name": "<vm-alias-2>",
+      "vm_name": "<VM-COMPUTERNAME-2>",
+      "host": "<HOST_OR_TAILSCALE_IP — 대외비>",
+      "port": 8599,
+      "os": "windows",
+      "desc": "<복제/추가 VM. 다른 VM은 per-VM 락이라 병렬 CU 가능>"
+    }
+  ]
+}

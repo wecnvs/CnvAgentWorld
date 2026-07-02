@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --bg: #0e1117;
   --panel: #161b22;
   --card: #1c2230;
@@ -20,7 +21,9 @@ body {
   font-family: -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
   background: var(--bg); color: var(--text);
   display: flex; flex-direction: column;
+  /* iOS 홈화면(스탠드얼론): 노치·홈인디케이터 영역을 비워 상·하단 버튼 터치 사각 방지 */
   padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
   padding-left: env(safe-area-inset-left);
   padding-right: env(safe-area-inset-right);
 }
@@ -52,11 +55,11 @@ body {
   flex: 1; min-height: 0; display: grid;
   grid-template-columns:
     minmax(150px, .62fr)
-    7px
+    10px
     minmax(190px, .78fr)
-    7px
+    10px
     minmax(320px, 1.35fr)
-    7px
+    10px
     minmax(260px, 1fr);
   overflow: hidden;
 }
@@ -70,18 +73,21 @@ body.panel-spaces-collapsed .spaces-pane,
 body.panel-chat-collapsed .chat-pane,
 body.panel-viewer-collapsed .viewer-pane { display: none; }
 .workspace-splitter {
-  width: 7px; min-width: 7px; min-height: 0; cursor: col-resize;
-  border-right: 1px solid var(--line); background: #0a0f17;
+  width: 10px; min-width: 10px; min-height: 0; cursor: col-resize;
+  border-left: 1px solid rgba(255,255,255,.05); border-right: 1px solid var(--line);
+  background: linear-gradient(90deg, #090d14 0%, #182132 50%, #090d14 100%);
   position: relative; touch-action: none;
 }
 .workspace-splitter::after {
-  content: ""; position: absolute; inset: 0 2px;
-  background: transparent; border-left: 1px solid transparent; border-right: 1px solid transparent;
+  content: ""; position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%, -50%); width: 3px; height: 42px; max-height: 45%;
+  border-left: 1px solid rgba(230,237,243,.36); border-right: 1px solid rgba(230,237,243,.18);
+  background: rgba(110,155,255,.35); border-radius: 2px;
 }
 .workspace-splitter:hover::after,
 .workspace-splitter:focus-visible::after,
 .workspace-splitter[data-active="yes"]::after {
-  border-color: var(--accent);
+  background: var(--accent); border-color: rgba(255,255,255,.6);
 }
 .workspace-splitter[data-hidden="yes"] { display: none; }
 body.layout-resizing { cursor: col-resize; user-select: none; }
@@ -205,12 +211,17 @@ select { cursor: pointer; }
   width: min(420px, 100%); background: var(--panel); border: 1px solid var(--line);
   border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 12px;
   box-shadow: 0 18px 60px rgba(0,0,0,.38);
+  /* 패널이 뷰포트보다 크면 내부에서만 스크롤한다. 중앙정렬로 상단(닫기 버튼)이 화면 밖으로
+     잘려 나가 모달을 닫지 못하고 전체 터치가 막히던 '갇힘'을 방지(특히 모바일). */
+  max-height: calc(100dvh - 32px); overflow-y: auto; overscroll-behavior: contain;
 }
 .modal-panel.wide { width: min(760px, 100%); }
 .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .modal-head h2 { margin: 0; font-size: 15px; }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field span { color: var(--muted); font-size: 12px; }
+/* hidden 속성이 .field 등 author display 규칙에 덮이지 않도록 강제(모달 숨김 필드가 실제로 숨겨지게). */
+[hidden] { display: none !important; }
 .work-settings-note {
   color: #fcd34d; background: #241a07; border: 1px solid #854d0e;
   border-radius: 6px; padding: 7px 9px; font-size: 12px; line-height: 1.35;
@@ -290,14 +301,58 @@ body.files-resizing iframe { pointer-events: none; }
 
 /* 공간 채팅방 */
 .room-view {
-  flex: 1; min-height: 0; display: flex; flex-direction: column;
+  flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; overflow: hidden;
 }
 .room-head {
   flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 10px 14px; border-bottom: 1px solid var(--line);
 }
+.room-head-main { flex: 1 1 auto; min-width: 0; }
 .room-head h2 { margin: 0; font-size: 15px; }
 .room-sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.room-head-toggle { white-space: nowrap; }
+.room-head-compact {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; border-bottom: 1px solid var(--line); background: #0f141d;
+}
+.room-head-compact-main {
+  flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 8px;
+}
+.room-head-compact strong {
+  min-width: 0; color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.room-head-compact span {
+  flex: 0 1 auto; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.room-head-compact .ghost {
+  flex: 0 0 auto; padding: 4px 9px; min-height: 28px; font-size: 12px;
+}
+#roomView[data-room-head-collapsed="yes"] .room-head { display: none; }
+.room-participants {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  margin-top: 7px; max-width: 100%; min-height: 0;
+}
+.room-participant-chip {
+  display: inline-flex; align-items: center; gap: 4px; min-height: 24px;
+  max-width: 180px; padding: 2px 8px; border: 1px solid #38527c; border-radius: 999px;
+  background: #101a2a; color: #dbe7ff; font-size: 11.5px; line-height: 1.25;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.room-participant-chip .participant-code {
+  color: var(--muted); font-family: ui-monospace, monospace; font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.room-participant-chip.empty {
+  border-style: dashed; border-color: var(--line); background: transparent; color: var(--muted);
+}
+.room-space-control {
+  flex: 0 1 230px; min-width: 170px; display: grid; gap: 3px;
+  color: var(--muted); font-size: 11px;
+}
+.room-space-control span { line-height: 1.1; }
+.room-space-control select {
+  min-height: 32px; padding: 5px 8px; font-size: 12px;
+}
 .room-status {
   margin-left: auto; color: var(--muted); border: 1px solid var(--line); border-radius: 999px;
   padding: 5px 10px; font-size: 12px; white-space: nowrap;
@@ -790,9 +845,19 @@ body.files-resizing iframe { pointer-events: none; }
   overflow-wrap: anywhere;
 }
 .room-messages {
-  flex: 1; min-height: 180px; overflow-y: auto; padding: 14px;
+  flex: 1; min-height: 180px; overflow-y: auto; overscroll-behavior: contain; padding: 14px;
   display: flex; flex-direction: column; gap: 10px;
+  -webkit-overflow-scrolling: touch;
 }
+.room-latest-btn {
+  position: absolute; left: 50%; transform: translateX(-50%); z-index: 20;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 34px; padding: 6px 14px; border: 1px solid rgba(255,255,255,.16);
+  border-radius: 999px; background: var(--accent); color: #fff;
+  box-shadow: 0 8px 24px rgba(0,0,0,.32); font-size: 12px; font-weight: 700;
+  cursor: pointer; white-space: nowrap;
+}
+.room-latest-btn:hover { filter: brightness(1.08); }
 .room-empty { color: var(--muted); padding: 28px; text-align: center; }
 .msg {
   max-width: min(760px, 92%); border: 1px solid var(--line); border-radius: 8px;
@@ -902,7 +967,8 @@ body.dock-dragging .term-frame { pointer-events: none; }
   body {
     position: static; overflow: auto; min-height: 100dvh; height: auto;
   }
-  .topbar { gap: 8px; padding: 8px 10px; flex-wrap: wrap; position: sticky; top: 0; z-index: 50; background: var(--bg); }
+  /* 노치 아래에 고정 — 상단 안전영역만큼 띄워 sticky (홈화면 스탠드얼론에서 상단 버튼 가림 방지) */
+  .topbar { gap: 8px; padding: 8px 10px; flex-wrap: wrap; position: sticky; top: env(safe-area-inset-top); z-index: 50; background: var(--bg); }
   .topbar h1 { font-size: 14px; }
   .toolbar { gap: 6px; flex-wrap: wrap; }
   .tool-btn { padding: 5px 8px; font-size: 12px; }
@@ -933,11 +999,15 @@ body.dock-dragging .term-frame { pointer-events: none; }
   /* 높이 = 스플릿바로 조절되는 CSS 변수(mobile-resize.js). JS 전이거나 미설정이면 기본값 폴백 */
   .people-pane { height: var(--m-h-agents, 30dvh); }
   .spaces-pane { height: var(--m-h-spaces, 30dvh); }
-  .chat-pane { height: var(--m-h-chat, 70dvh); min-height: 0; max-height: none; }
+  .chat-pane {
+    height: min(var(--m-h-chat, 88dvh), calc(100dvh - 8px));
+    min-height: min(420px, calc(100dvh - 8px)); max-height: calc(100dvh - 8px);
+  }
   /* 뷰어: 명시적 높이를 줘야 .views(flex)가 공간을 받아 파일/케이스 탐색기가 보인다(absolute .view 붕괴 방지) */
   .viewer-pane { height: 56dvh; display: flex; }
   .views { min-height: 0; }
-  .room-messages { min-height: 120px; }
+  .room-view { min-height: 0; overflow: hidden; }
+  .room-messages { min-height: 0; }
   .files-list { flex-basis: 220px; }
   .files-splitter { min-height: 9px; height: 9px; flex-basis: 9px; }
   .card-list li { padding: 10px; gap: 5px; }
@@ -946,18 +1016,36 @@ body.dock-dragging .term-frame { pointer-events: none; }
   .seat-actions { max-height: 120px; }
   button.edit-btn { min-height: 36px; padding: 8px 7px; font-size: 12px; }
   .row.actions { justify-content: flex-start; }
-  .room-head { align-items: flex-start; flex-wrap: wrap; }
-  .room-status { margin-left: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+  .room-head { align-items: flex-start; flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
+  .room-head-main { width: 100%; flex-basis: 100%; }
+  .room-head-toggle { min-height: 32px; }
+  .room-head-compact { padding: 6px 8px; gap: 6px; }
+  .room-head-compact-main { gap: 6px; }
+  .room-head-compact strong { font-size: 12.5px; }
+  .room-head-compact span { font-size: 11.5px; }
+  .room-head-compact .ghost { min-height: 32px; padding: 4px 8px; }
+  .room-participants {
+    flex-wrap: nowrap; max-height: 30px; overflow-x: auto; overflow-y: hidden;
+    overscroll-behavior: contain; padding-bottom: 2px;
+  }
+  .room-participant-chip { flex: 0 0 auto; max-width: 190px; min-height: 22px; padding: 2px 7px; }
+  .room-space-control { flex: 1 1 230px; width: auto; min-width: 0; }
+  .room-space-control span { display: none; }
+  .room-space-control select { min-height: 32px; }
+  .room-status {
+    margin-left: 0; min-height: 32px; display: flex; align-items: center;
+    max-width: 100%; white-space: normal; overflow-wrap: anywhere;
+  }
   .room-member-control {
     width: 100%; grid-template-columns: minmax(0, 1fr) auto;
   }
-  .room-member-control select, .room-member-control button { min-height: 34px; }
-  .room-diagnostics-toolbar { grid-template-columns: 1fr; padding: 5px 10px; gap: 5px; }
+  .room-member-control select, .room-member-control button { min-height: 32px; }
+  .room-diagnostics-toolbar { grid-template-columns: auto minmax(0, 1fr); align-items: center; padding: 5px 10px; gap: 6px; }
   .observer-section-toggles { flex-wrap: nowrap; overflow-x: auto; justify-content: flex-start; }
   .observer-toggle { min-height: 34px; padding: 5px 8px; }
-  .room-snapshot { max-height: 72px; overflow-y: auto; padding: 6px 10px; gap: 5px; }
+  .room-snapshot { max-height: 56px; overflow-y: auto; padding: 5px 10px; gap: 5px; }
   .snapshot-chip { min-height: 22px; padding: 2px 6px; font-size: 10.5px; }
-  .room-observer-stack { max-height: min(42dvh, 320px); overflow-y: auto; overscroll-behavior: contain; }
+  .room-observer-stack { max-height: min(16dvh, 128px); overflow-y: auto; overscroll-behavior: contain; }
   .room-status-detail { grid-template-columns: 1fr; max-height: 96px; overflow-y: auto; padding: 6px 10px; }
   .status-detail-row { grid-template-columns: minmax(60px, 0.35fr) minmax(0, 1fr); padding: 5px 6px; }
   .chat-flow-panel { padding: 6px 10px; gap: 5px; max-height: 132px; overflow-y: auto; }
@@ -1003,14 +1091,26 @@ body.dock-dragging .term-frame { pointer-events: none; }
   .promotion-review-actions { justify-content: flex-start; }
   .promotion-review-action { min-height: 38px; padding: 6px 9px; }
   .promotion-review-preview, .promotion-review-path, .promotion-review-empty { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .room-activity { max-height: 78px; padding: 6px 10px; }
-  .room-form { grid-template-columns: 1fr; align-items: stretch; }
-  .room-manager-lock { margin-bottom: 0; justify-content: center; }
+  .room-activity { max-height: 64px; padding: 6px 10px; }
+  .room-work-banner { min-height: 32px; padding: 6px 9px; font-size: 12px; }
+  .room-work-head .ghost { min-height: 28px; padding: 3px 8px; margin-right: 6px; }
+  .room-work-console { height: 220px; max-height: 24dvh; }
+  .room-form {
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    align-items: end; gap: 6px; padding: 8px 10px;
+  }
+  .room-form textarea { min-height: 38px; max-height: 96px; resize: none; }
+  .room-latest-btn { min-height: 36px; padding: 7px 15px; }
+  .room-manager-lock {
+    margin-bottom: 0; justify-content: center; max-width: 82px; min-height: 38px;
+    padding: 4px 6px; font-size: 10.5px; white-space: normal; text-align: center; line-height: 1.25;
+  }
+  .room-attach-btn, #room-send { min-height: 38px; padding: 7px 8px; }
   .modal { align-items: flex-end; padding: 10px; }
   .modal-panel { max-height: 92dvh; overflow: auto; }
 }
 
-/* 케이스(경우의 수) 검토 패널 */
+/* 스킬/케이스 검토 패널 */
 .cases-header { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); flex: 0 0 auto; }
 .cases-hint { color: var(--muted); font-size: 12px; }
 .cases-split { display: grid; grid-template-columns: minmax(130px, 0.7fr) 1.6fr; flex: 1 1 auto; min-height: 0; }
@@ -1023,6 +1123,16 @@ body.dock-dragging .term-frame { pointer-events: none; }
 .cases-detail { overflow: auto; padding: 10px; display: flex; flex-direction: column; gap: 9px; min-height: 0; }
 .cases-detail .empty { color: var(--muted); text-align: center; padding: 20px; }
 .cases-detail-title { font-size: 13px; color: var(--text); font-weight: 600; }
+.skill-summary { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--card); display: flex; flex-direction: column; gap: 8px; }
+.skill-summary-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.skill-summary-name { font-size: 14px; font-weight: 700; color: var(--text); margin-right: 2px; overflow-wrap: anywhere; }
+.skill-description { font-size: 13px; color: var(--text); line-height: 1.55; overflow-wrap: anywhere; }
+.skill-path { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.skill-source { border-top: 1px solid var(--line); padding-top: 7px; }
+.skill-source-summary { cursor: pointer; color: var(--accent); font-size: 12px; }
+.skill-source-code { margin: 8px 0 0; max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; color: var(--text); background: rgba(0,0,0,.18); border: 1px solid var(--line); border-radius: 7px; padding: 9px; }
+.cases-section-title { font-size: 12px; font-weight: 700; color: var(--text); margin-top: 2px; }
+.cases-load-note { font-size: 12px; color: #ffb4b4; border: 1px solid #7f1d1d; border-radius: 7px; padding: 7px 9px; background: #2a1010; }
 .case-card { border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; background: var(--card); display: flex; flex-direction: column; gap: 5px; }
 .case-card[data-status="active"] { border-left: 3px solid #3fb950; }
 .case-card[data-status="provisional_must"] { border-left: 3px solid #f59e0b; }
@@ -1041,11 +1151,38 @@ body.dock-dragging .term-frame { pointer-events: none; }
 .case-line { font-size: 13px; color: var(--text); }
 .case-line.strong { font-weight: 600; }
 .case-line.conflict-with { font-size: 12px; color: #ffb4b4; }
-/* 작업 중 라이브 배너 — 대표가 "지금 뭔가 돌고 있다"를 메인 흐름에서 바로 본다 */
-.room-work-banner { flex: 0 0 auto; padding: 7px 12px; font-size: 13px; border-bottom: 1px solid var(--line);
-  background: #0e2233; color: #bfe0ff; display: flex; align-items: center; gap: 6px; }
-.room-work-banner[data-kind="work"] { background: #11271a; color: #9be6b8; }
-.room-work-banner[data-kind="agent"] { background: #1c2436; color: #c7d2fe; }
+/* 작업 중 라이브 패널 — 상태 한 줄에서 실제 콘솔 iframe까지 접고 펼친다. */
+.room-work-panel {
+  flex: 0 0 auto; display: flex; flex-direction: column;
+  border-bottom: 1px solid var(--line); background: #0e2233; color: #bfe0ff;
+}
+.room-work-panel[data-kind="work"] { background: #11271a; color: #9be6b8; }
+.room-work-panel[data-kind="agent"] { background: #1c2436; color: #c7d2fe; }
+.room-work-head {
+  min-width: 0; display: flex; align-items: center; gap: 6px; padding: 0;
+}
+.room-work-banner {
+  flex: 1 1 auto; min-width: 0; min-height: 34px; padding: 7px 12px;
+  border: 0; background: transparent; color: inherit; text-align: left;
+  font: inherit; font-size: 13px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.room-work-head .ghost {
+  flex: 0 0 auto; margin-right: 8px; padding: 3px 9px; border: 1px solid rgba(255,255,255,.18);
+  border-radius: 6px; background: rgba(0,0,0,.08); color: inherit; text-decoration: none;
+  font-size: 12px; line-height: 1.35; cursor: pointer;
+}
+.room-work-open[hidden] + #room-work-toggle { margin-left: auto; }
+.room-work-panel.collapsed .room-work-console { display: none !important; }
+.room-work-console {
+  height: 300px; max-height: 34vh; border-top: 1px solid rgba(255,255,255,.12);
+  background: #0e1117; color: #cdd6e3; min-height: 0;
+}
+.room-work-frame { width: 100%; height: 100%; border: 0; display: block; background: #0e1117; }
+.room-work-empty {
+  height: 100%; display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 12px; color: #9aa6b5; font-size: 12px; text-align: center;
+}
+.room-work-empty a { color: #7cc4ff; text-decoration: underline; }
 
 /* §9.1 통합 검토 배너 — 격리된 모순을 대표에게 '보이게' */
 .cases-review-banner { padding: 8px 10px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; flex: 0 0 auto; }
@@ -1091,3 +1228,406 @@ a.msg-embed-card.mobile-open { display: block; text-decoration: none; color: inh
 .img-lightbox-img { max-width: 94vw; max-height: 92vh; border-radius: 6px; box-shadow: 0 10px 50px rgba(0,0,0,0.6); }
 .img-lightbox-close { position: absolute; top: 16px; right: 20px; width: 40px; height: 40px; border: none; border-radius: 50%; background: rgba(255,255,255,0.14); color: #fff; font-size: 20px; cursor: pointer; }
 .img-lightbox-close:hover { background: rgba(255,255,255,0.28); }
+
+/* 앱 탭 — 앱/ 폴더의 애플리케이션을 종류별 카드로 */
+.apps-header { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+.apps-hint { color: var(--muted); font-size: 12px; }
+.apps-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.apps-list .empty { color: var(--muted); text-align: center; padding: 24px 12px; border: 1px dashed var(--line); border-radius: 8px; }
+.apps-empty code { background: var(--card); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+.app-card { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--card); display: flex; flex-direction: column; gap: 7px; }
+.app-card[data-kind="web-app"] { border-left: 3px solid #2f9d57; }
+.app-card[data-kind="standalone"] { border-left: 3px solid var(--accent); }
+.app-card[data-kind="revit-addin"] { border-left: 3px solid #b9791f; }
+.app-card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.app-name { font-size: 14px; font-weight: 600; color: var(--text); flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.app-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+.app-badges span { font-size: 10.5px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.app-kind { color: var(--text) !important; }
+.app-target { color: var(--text) !important; font-weight: 600; }
+.app-target.ch-local { color: var(--muted) !important; }
+.app-target.ch-cu-helper { color: #a9d8ff !important; border-color: #2a5a8a !important; background: #0e2236; }
+.app-target.ch-ssh { color: #c9b6ff !important; border-color: #4a3a7a !important; background: #1a1430; }
+.app-target.ch-parallels { color: #ffd9a3 !important; border-color: #7a5414 !important; background: #2a1a08; }
+.app-target.unconfigured { color: #ffc9c9 !important; border-color: #7f1d1d !important; background: #3a1212; }
+.app-grade.g-대외비 { color: #ffc9c9 !important; border-color: #7f1d1d !important; background: #3a1212; }
+.app-status.s-ready { color: #7ee2a8 !important; }
+.app-status.s-wip { color: #ffe8a3 !important; }
+.app-status.s-deprecated { color: #ffb4b4 !important; }
+.app-desc { font-size: 12.5px; color: var(--text); opacity: 0.92; line-height: 1.45; overflow-wrap: anywhere; }
+.app-actions { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+.app-noact { font-size: 11.5px; color: var(--muted); font-style: italic; }
+.app-act { font-size: 12.5px; padding: 5px 11px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; min-height: 30px; }
+.app-act:hover { border-color: var(--accent); }
+.app-act.run { background: var(--accent); color: #fff; border-color: var(--accent); }
+.app-act.run:hover { filter: brightness(1.08); }
+.app-act.run:disabled { opacity: 0.7; cursor: default; }
+.app-act.open { color: #7ee2a8; border-color: #1f6b3f; }
+.app-act.install { color: #ffd9a3; border-color: #7a5414; }
+.app-act.stop { color: #ffb4b4; border-color: #7f1d1d; }
+.app-act.stop:hover { border-color: #ef4444; }
+.app-card.is-running { border-left-color: #3fb950; }
+.app-running { color: #7ee2a8 !important; border-color: #1f6b3f !important; background: #11271a; font-weight: 600; }
+.app-webhint { font-size: 11px; color: var(--muted); font-style: italic; }
+.app-files { font-size: 11.5px; }
+.app-files > summary { color: var(--muted); cursor: pointer; padding: 2px 0; list-style: revert; }
+.app-files-body { display: flex; flex-direction: column; gap: 3px; margin-top: 5px; }
+.app-file { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); text-decoration: none; }
+.app-file:hover { border-color: var(--accent); color: var(--text); }
+.app-file .afn { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-file .afs { font-family: ui-monospace, monospace; font-size: 11px; }
+.app-file.is-install .afn { color: #ffd9a3; }
+.app-path { font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+
+/* ===========================================================================
+   라이트 모드 — html[data-theme="light"] 일 때만 적용.
+   다크 규칙은 그대로 두고(회귀 0) 라이트 값만 덮어쓴다.
+   1) 핵심 변수 교체 → var(--*) 쓰는 곳은 자동 전환
+   2) 하드코딩된 '어두운 표면/버튼/말풍선'을 밝게 덮기
+   3) 진단 칩/행은 밝은 표면 + 어두운 글자, 색조(테두리)는 유지해 의미 보존
+   =========================================================================== */
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6fa;
+  --panel: #ffffff;
+  --card: #f1f4f9;
+  --line: #d7dde6;
+  --text: #1b2330;
+  --muted: #5a6573;
+  --accent: #2f6ae0;
+  --ok: #1a7f37;
+  /* 영역색: 흰 배경 대비 위해 약간 진하게 */
+  --area-agents: #2f6ae0;
+  --area-spaces: #1f9d57;
+  --area-chat:   #b9791f;
+  --area-viewer: #7c4dd0;
+  /* 밝은 보조 표면 */
+  --l-sunken: #e6eaf1;   /* 스플릿바 등 가라앉은 면 */
+  --l-head:   #eef1f7;   /* 패널 헤더·진단 패널 바탕 */
+  --l-surface2: #eef2f8; /* 내부 행/칩/입력 */
+  --l-input:  #ffffff;
+  --l-text2:  #3b4654;   /* 본문 보조 글자 */
+}
+
+/* 입력류 */
+html[data-theme="light"] input,
+html[data-theme="light"] select,
+html[data-theme="light"] textarea,
+html[data-theme="light"] .room-form textarea { background: var(--l-input); }
+
+/* 가라앉은 면(스플릿바) */
+html[data-theme="light"] .workspace-splitter,
+html[data-theme="light"] .files-splitter { background: var(--l-sunken); }
+html[data-theme="light"] .workspace-splitter {
+  border-left-color: #c5cedb; border-right-color: #c5cedb;
+  background: linear-gradient(90deg, #d7dde6 0%, #f7f9fc 50%, #d7dde6 100%);
+}
+html[data-theme="light"] .workspace-splitter::after {
+  background: #6d7c8f; border-left-color: rgba(27,35,48,.25); border-right-color: rgba(27,35,48,.14);
+}
+
+/* 영역 패널 — 밝은 영역 틴트 */
+html[data-theme="light"] .people-pane { background: #f0f5fe; }
+html[data-theme="light"] .spaces-pane { background: #eef9f2; }
+html[data-theme="light"] .chat-pane   { background: #fbf7f0; }
+html[data-theme="light"] .viewer-pane { background: #f6f1fd; }
+html[data-theme="light"] .people-pane > .panel-head { background: #e6eefb; border-bottom-color: #bcd0f3; }
+html[data-theme="light"] .spaces-pane > .panel-head { background: #e2f4e9; border-bottom-color: #aedcc0; }
+html[data-theme="light"] .chat-pane   > .panel-head { background: #fbf0dd; border-bottom-color: #e7cb95; }
+html[data-theme="light"] .viewer-pane > .panel-head { background: #f0e8fb; border-bottom-color: #cdb6ef; }
+
+/* 헤더/툴바/진단 패널 바탕 */
+html[data-theme="light"] .panel-head,
+html[data-theme="light"] .room-head-compact,
+html[data-theme="light"] .room-snapshot,
+html[data-theme="light"] .room-diagnostics-toolbar,
+html[data-theme="light"] .room-status-detail,
+html[data-theme="light"] .chat-flow-panel,
+html[data-theme="light"] .obligation-panel,
+html[data-theme="light"] .turn-handoff-panel,
+html[data-theme="light"] .task-panel,
+html[data-theme="light"] .candidate-panel,
+html[data-theme="light"] .promotion-review-panel,
+html[data-theme="light"] .room-activity { background: var(--l-head); }
+html[data-theme="light"] .pv-head { background: var(--panel); }
+
+/* 진단 행/스텝/칩/카운트 — 밝은 표면 + 어두운 글자(테두리 색조는 유지) */
+html[data-theme="light"] .status-detail-row,
+html[data-theme="light"] .chat-flow-step,
+html[data-theme="light"] .obligation-row,
+html[data-theme="light"] .turn-handoff-row,
+html[data-theme="light"] .task-row,
+html[data-theme="light"] .candidate-row,
+html[data-theme="light"] .promotion-review-row,
+html[data-theme="light"] .snapshot-chip,
+html[data-theme="light"] .obligation-count,
+html[data-theme="light"] .task-count,
+html[data-theme="light"] .candidate-count,
+html[data-theme="light"] .promotion-review-count,
+html[data-theme="light"] .observer-toggle { background: var(--l-surface2); color: var(--l-text2); }
+
+/* 의미 강조 — 위험(빨강)/정상(초록)/대기(앰버) 상태는 밝은 틴트로 보존 */
+html[data-theme="light"] .snapshot-chip.failure,
+html[data-theme="light"] .obligation-count.failed,
+html[data-theme="light"] .obligation-row.failed,
+html[data-theme="light"] .task-count.error,
+html[data-theme="light"] .task-row.error,
+html[data-theme="light"] .candidate-count.error,
+html[data-theme="light"] .candidate-row.error,
+html[data-theme="light"] .status-detail-row.failure,
+html[data-theme="light"] .status-detail-row.error,
+html[data-theme="light"] .chat-flow-step.failed { background: #fdecec; color: #9b1c1c; }
+html[data-theme="light"] .snapshot-chip.publish,
+html[data-theme="light"] .obligation-count.answered,
+html[data-theme="light"] .obligation-row.answered,
+html[data-theme="light"] .task-count.running,
+html[data-theme="light"] .task-row.running,
+html[data-theme="light"] .candidate-count.selected,
+html[data-theme="light"] .candidate-row.selected,
+html[data-theme="light"] .promotion-review-count.approved,
+html[data-theme="light"] .chat-flow-step.done { background: #e5f5ea; color: #1c6b3a; }
+html[data-theme="light"] .snapshot-chip.backlog,
+html[data-theme="light"] .obligation-count.open,
+html[data-theme="light"] .obligation-row.open,
+html[data-theme="light"] .task-count.cancel,
+html[data-theme="light"] .promotion-review-count.pending,
+html[data-theme="light"] .chat-flow-step.current { background: #fbf3df; color: #8a5a00; }
+
+/* 진단 내부 보조 글자(밝은 회색 → 어둡게) */
+html[data-theme="light"] .chat-flow-detail,
+html[data-theme="light"] .obligation-preview,
+html[data-theme="light"] .obligation-empty,
+html[data-theme="light"] .turn-handoff-brief,
+html[data-theme="light"] .activity-detail,
+html[data-theme="light"] .task-note,
+html[data-theme="light"] .candidate-preview,
+html[data-theme="light"] .promotion-review-preview,
+html[data-theme="light"] .promotion-review-empty,
+html[data-theme="light"] .sub.runtime,
+html[data-theme="light"] .sub.work-settings { color: var(--l-text2); }
+html[data-theme="light"] .chat-flow-head span,
+html[data-theme="light"] .turn-handoff-head span { color: #1e478f; }
+html[data-theme="light"] .obligation-head span,
+html[data-theme="light"] .obligation-state { color: #8a5a00; }
+
+/* 버튼류 */
+html[data-theme="light"] button.edit-btn { background: #e7eefb; color: #1e3a72; border-color: #aac4ee; }
+html[data-theme="light"] button.edit-btn:hover { background: #d7e3f8; }
+html[data-theme="light"] button.edit-btn.danger { background: #fdecec; color: #9b1c1c; border-color: #f1b5b5; }
+html[data-theme="light"] .seat-settings-panel { background: #f1f4f9; border-color: #d7dde6; }
+html[data-theme="light"] .seat-settings-panel > summary { color: #27406e; }
+html[data-theme="light"] .seat-work-settings-btn { background: #eef2f8; color: #27406e; border-color: #c7d3e6; }
+html[data-theme="light"] .seat-work-settings-btn:hover { background: #e1e9f6; color: #14223c; }
+html[data-theme="light"] .status-action { background: #eef2f8; color: var(--text); }
+html[data-theme="light"] .task-action { background: #eef6e3; color: #356414; border-color: #bcdd96; }
+html[data-theme="light"] .task-action.danger { background: #fdf0dc; color: #92500e; border-color: #e8c489; }
+html[data-theme="light"] .promotion-review-action { background: #e8f0fd; color: #1e478f; border-color: #aac4ee; }
+html[data-theme="light"] .promotion-review-action.apply { background: #e5f5ea; color: #1c6b3a; border-color: #9cd2ad; }
+html[data-theme="light"] .promotion-review-action.scan { background: #fbf3df; color: #8a5a00; border-color: #e6cf8f; }
+html[data-theme="light"] .activity-filter { background: #eef2f8; color: var(--muted); }
+html[data-theme="light"] .activity-filter[aria-pressed="true"] { background: #e3ecfb; color: #1e478f; border-color: #aac4ee; }
+html[data-theme="light"] .work-settings-note { background: #fdf6e3; border-color: #e6cf8f; color: #7a5b12; }
+html[data-theme="light"] .room-participant-chip { background: #e8f0fd; color: #1e478f; border-color: #aac4ee; }
+html[data-theme="light"] .room-participant-chip.empty { background: transparent; color: var(--muted); border-color: var(--line); }
+
+/* 스킬/케이스 패널(승격/검토) */
+html[data-theme="light"] .cases-skill-item.active { background: #e3ecfb; }
+html[data-theme="light"] button.small.danger,
+html[data-theme="light"] .review-chip.danger { background: #fdecec; color: #9b1c1c; border-color: #f1b5b5; }
+html[data-theme="light"] .skill-source-code { background: #f6f8fa; }
+html[data-theme="light"] .cases-load-note { background: #fdecec; color: #9b1c1c; border-color: #f1b5b5; }
+html[data-theme="light"] .case-polarity.worked { background: #e5f5ea; color: #1c6b3a; }
+html[data-theme="light"] .case-polarity.failed { background: #fdecec; color: #9b1c1c; }
+html[data-theme="light"] .case-badge.conflict { background: #fdecec; color: #9b1c1c; border-color: #f1b5b5; }
+html[data-theme="light"] .case-badge.ready { background: #e1f3f3; color: #156464; }
+html[data-theme="light"] .case-badge.review { background: #fbf3df; color: #8a5a00; }
+html[data-theme="light"] .review-banner-head { color: #8a5a00; }
+html[data-theme="light"] .review-banner-head.danger { color: #9b1c1c; }
+/* 앱 탭 — 밝은 표면 대비 보정 */
+html[data-theme="light"] .app-act.open { color: #1c6b3a; border-color: #9cd2ad; }
+html[data-theme="light"] .app-act.install { color: #8a5a00; border-color: #e3c98c; }
+html[data-theme="light"] .app-status.s-ready { color: #1c6b3a !important; }
+html[data-theme="light"] .app-status.s-wip { color: #8a5a00 !important; }
+html[data-theme="light"] .app-status.s-deprecated { color: #9b1c1c !important; }
+html[data-theme="light"] .app-grade.g-대외비 { color: #9b1c1c !important; background: #fdecec; border-color: #f1b5b5 !important; }
+html[data-theme="light"] .app-file.is-install .afn { color: #8a5a00; }
+html[data-theme="light"] .app-running { color: #1c6b3a !important; background: #e5f5ea; border-color: #9cd2ad !important; }
+html[data-theme="light"] .app-act.stop { color: #9b1c1c; border-color: #f1b5b5; }
+
+/* 말풍선 */
+html[data-theme="light"] .msg.boss { background: #e9f0fd; border-color: #b9cdf2; }
+html[data-theme="light"] .msg.manager { background: #eef1f5; border-color: #cdd5df; }
+html[data-theme="light"] .msg.outbox.pending,
+html[data-theme="light"] .msg.outbox.sending { background: #eef2f8; border-color: #aac4ee; }
+html[data-theme="light"] .msg.outbox.acked { background: #e6f5ea; border-color: #9cd2ad; }
+html[data-theme="light"] .msg.outbox.error { background: #fdecec; border-color: #f1b5b5; }
+html[data-theme="light"] .msg.handback-highlight { background: #fbf3df; }
+html[data-theme="light"] .msg.approval-highlight { background: #e7f1fb; }
+html[data-theme="light"] .msg-body a { color: #1f5fc4; }
+html[data-theme="light"] .approval-btn.reject { background: #ecdfe1; color: #8a2230; }
+
+/* 작업 배너 / 입장 잠금 */
+html[data-theme="light"] .room-work-panel { background: #e6f0fb; color: #1e4a86; }
+html[data-theme="light"] .room-work-panel[data-kind="work"] { background: #e6f5ea; color: #1c6b3a; }
+html[data-theme="light"] .room-work-panel[data-kind="agent"] { background: #edf0fb; color: #384a99; }
+html[data-theme="light"] .room-work-console { background: #f8fafc; color: #334155; }
+html[data-theme="light"] .room-work-empty { color: #64748b; }
+html[data-theme="light"] .room-manager-lock { background: #e8f0fd; border-color: #aac4ee; color: #1e478f; }
+
+/* 방 상태 칩 — 밝은 배경 대비 위해 글자 진하게 */
+html[data-theme="light"] .room-status[data-state="manager_running"],
+html[data-theme="light"] .room-status[data-state="manager_queued"],
+html[data-theme="light"] .room-status[data-state="manager_retrying"] { color: #8a5a00; border-color: #d9b24a; }
+html[data-theme="light"] .room-status[data-state="agent_running"] { color: #1c6a86; border-color: #7fb8cf; }
+html[data-theme="light"] .room-status[data-stale="yes"] { color: #9a3412; border-color: #e0a06a; background: #fbeede; }
+
+/* 테마 토글 버튼 */
+.theme-toggle { line-height: 1; }
+
+/* ── 방 안 감시모드 패널 (관리자에이전트 인터랙티브 세션 임베드) ── */
+.room-monitor { flex: 0 0 auto; display: flex; flex-direction: column; margin: 6px 0;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--panel); overflow: hidden; }
+.room-monitor.collapsed .room-monitor-frames { display: none; }
+.room-monitor-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  border-bottom: 1px solid var(--line); }
+.room-monitor.collapsed .room-monitor-head { border-bottom: 0; }
+.room-monitor-title { flex: 1 1 auto; font-size: 12px; font-weight: 600; color: var(--text); min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-monitor-meta { font-size: 11px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+.room-monitor-head .ghost { flex: 0 0 auto; text-decoration: none; line-height: 1.4;
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+  padding: 3px 9px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+.room-monitor-head .ghost:hover { color: var(--text); }
+.room-monitor-frames { height: 300px; max-height: 34vh; }
+.room-monitor-frame { width: 100%; height: 100%; border: 0; display: block; background: #0e1117; }
+/* 데스크톱: 감시 패널이 열려도 입력창(room-form)이 항상 보이도록 메시지 영역을 양보시킨다. */
+#roomView:has(#room-monitor:not([hidden])) .room-messages { min-height: 64px; }
+#roomView:has(#room-work-panel:not([hidden])) .room-messages { min-height: 64px; }
+@media (max-width: 720px) {
+  .room-monitor { max-height: min(44dvh, 340px); }
+  .room-monitor-frames { height: 240px; max-height: 30dvh; }
+  #roomView:has(#room-monitor:not([hidden])) .room-messages { min-height: 96px; }
+  #roomView:has(#room-work-panel:not([hidden])) .room-messages { min-height: 96px; }
+}
+
+/* ── 감시 소견 칩/패널 (감시 에이전트가 기록한 두 기준 평가 가시화) ── */
+.snapshot-chip.watchlive { color: #bbf7d0; border-color: #15803d; background: #0d2415; font-family: inherit; }
+.snapshot-chip.watch { font-family: inherit; }
+.snapshot-chip.watch.ok { color: #d1fae5; border-color: #047857; background: #08251b; }
+.snapshot-chip.watch.warn { color: #fef3c7; border-color: #a16207; background: #211a08; }
+.snapshot-chip.watch.bad { color: #fda4af; border-color: #7f1d1d; background: #2a0f12; }
+.snapshot-chip.watch.unknown { color: var(--muted); }
+
+.watch-report-panel { display: flex; flex-direction: column; gap: 6px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); }
+.watch-report-panel[data-empty="yes"] { display: none; }
+.watch-report-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.watch-line { font-size: 12px; color: var(--text); }
+.watch-line b { color: var(--muted); font-weight: 600; margin-right: 4px; }
+.watch-summary { font-size: 12px; color: var(--text); opacity: 0.92; }
+.watch-findings { margin: 2px 0 0; padding-left: 2px; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.watch-findings li { font-size: 12px; color: var(--text); }
+.watch-findings li.sev-warn { color: #fcd34d; }
+.watch-findings li.sev-bad { color: #fda4af; }
+.watch-meta { font-size: 10px; color: var(--muted); }
+
+/* ── 원격제어 패널(remote-panel.js) — 세션 라이브 화면 + 클릭/타이핑 ── */
+.rp-overlay {
+  position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.62); padding: 16px;
+}
+.rp-box {
+  display: flex; flex-direction: column; width: min(1280px, 96vw); max-height: 96vh;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+.rp-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.rp-title { font-size: 13px; font-weight: 700; color: var(--text); }
+.rp-host { font-size: 11px; color: var(--muted); }
+.rp-spacer { flex: 1; }
+.rp-lock { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.rp-lock.ok { color: #34d399; border-color: #34d39966; background: #34d39915; }
+.rp-lock.ro { color: #fcd34d; border-color: #fcd34d66; background: #fcd34d12; }
+.rp-lock.err { color: #fda4af; border-color: #fda4af66; background: #fda4af12; }
+.rp-btn {
+  background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer;
+}
+.rp-btn:hover { border-color: var(--accent); }
+.rp-modebtn {
+  font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--muted); cursor: pointer; white-space: nowrap;
+}
+.rp-modebtn:hover { border-color: var(--accent); }
+.rp-modebtn.ok { color: #16a34a; border-color: #16a34a66; background: #16a34a14; }
+.rp-modebtn.ro { color: #d97706; border-color: #d9770666; background: #d9770612; }
+.rp-modebtn.err { color: #dc2626; border-color: #dc262666; }
+.rp-close { color: var(--muted); }
+.rp-stage {
+  position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
+  overflow: auto; background: #000; outline: none;
+}
+.rp-stage:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.rp-screen {
+  display: block; max-width: 100%; max-height: calc(96vh - 168px); width: auto; height: auto;
+  user-select: none; -webkit-user-drag: none; cursor: not-allowed;
+}
+.rp-stage.controlling .rp-screen { cursor: crosshair; }
+.rp-msg {
+  position: absolute; left: 50%; top: 14px; transform: translateX(-50%);
+  background: rgba(15, 20, 29, 0.92); color: #fde68a; border: 1px solid var(--line);
+  padding: 6px 12px; border-radius: 999px; font-size: 12px; max-width: 86%; text-align: center;
+}
+.rp-controls { padding: 8px 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 7px; }
+.rp-keys { display: flex; flex-wrap: wrap; gap: 5px; }
+.rp-key {
+  background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+  padding: 3px 9px; font-size: 11px; cursor: pointer;
+}
+.rp-key:hover { border-color: var(--accent); }
+.rp-typebar { display: flex; align-items: center; gap: 8px; }
+.rp-textin {
+  flex: 1; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 7px; padding: 6px 10px; font-size: 13px;
+}
+.rp-enter-after { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.rp-hint { font-size: 10px; color: var(--muted); line-height: 1.4; }
+@media (max-width: 720px) {
+  .rp-box { width: 100vw; max-height: 100vh; border-radius: 0; }
+  .rp-screen { max-height: calc(100vh - 196px); }
+}
+
+/* ── 원격 세션 카드(앱 탭의 호스트/VM 직접 제어) ── */
+.apps-subhead {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin: 14px 4px 7px; padding-top: 12px; border-top: 1px solid var(--line);
+  font-size: 12px; font-weight: 700; color: var(--muted);
+}
+.sess-openall { font-size: 11px; white-space: nowrap; }
+.sess-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.sess-card .app-name { font-size: 13px; }
+
+/* ── 원격제어 그리드(remote-panel.js, 다중 타일 동시) ── */
+.rpg-overlay { position: fixed; inset: 0; z-index: 40; display: flex; flex-direction: column; background: rgba(0, 0, 0, 0.72); }
+.rpg-overlay.standalone { background: var(--bg); }   /* 별도 창(remote.html): 뒤에 대시보드 없으니 불투명 */
+.rpg-head { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.rpg-title { font-size: 13px; font-weight: 700; color: var(--text); }
+.rpg-meta { font-size: 11px; color: var(--muted); }
+.rpg-grid {
+  flex: 1; min-height: 0; overflow: auto; padding: 10px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 10px; align-content: start;
+}
+.rpg-tile { display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; outline: none; }
+.rpg-tile.focused { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.rpg-tile-head { display: flex; align-items: center; gap: 6px; padding: 5px 9px; border-bottom: 1px solid var(--line); }
+.rpg-tile-name { font-size: 12px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
+.rpg-tile-screen { position: relative; background: #000; display: flex; align-items: center; justify-content: center; }
+.rpg-tile-screen .rp-screen { display: block; max-width: 100%; max-height: 46vh; width: auto; height: auto; margin: 0 auto; user-select: none; -webkit-user-drag: none; cursor: not-allowed; }
+.rpg-tile.controlling .rpg-tile-screen .rp-screen { cursor: crosshair; }
+.rpg-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 14px; background: var(--panel); border-top: 1px solid var(--line); }
+.rpg-barlabel { font-size: 11px; color: var(--muted); min-width: 120px; }
+.rpg-typebar { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 200px; }
+@media (max-width: 720px) {
+  .rpg-grid { grid-template-columns: 1fr; }
+  .rpg-tile-screen .rp-screen { max-height: 38vh; }
+}

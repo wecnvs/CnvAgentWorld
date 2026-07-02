@@ -82,6 +82,15 @@ def review_all():
     return {"total_conflicts": total_conflicts, "total_review": total_review, "skills": skills_out}
 
 
+@router.get("/{skill}")
+def skill_detail(skill: str):
+    """선택한 스킬의 frontmatter 설명과 SKILL.md 원문을 대시보드에 제공한다."""
+    try:
+        return skill_smith.skill_detail(skill)
+    except skill_smith.SkillSmithError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 @router.get("/{skill}/cases")
 def list_cases(skill: str):
     sdir = _sdir(skill)

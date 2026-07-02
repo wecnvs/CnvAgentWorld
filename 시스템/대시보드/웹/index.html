@@ -3,8 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <!-- iOS 홈화면 스탠드얼론: 안전영역(env) 활성화 + 상태바 투명 -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0e1117">
   <title>CnvAgentWorld</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=20260629-30">
+  <!-- 테마를 페인트 전에 확정해 깜빡임(FOUC) 방지. 저장값 > 시스템설정 > 다크 -->
+  <script>
+    (function () {
+      var theme = "dark";
+      try {
+        var saved = localStorage.getItem("cnv.theme");
+        theme = saved || (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      } catch (e) {}
+      document.documentElement.setAttribute("data-theme", theme);
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", theme === "light" ? "#f4f6fa" : "#0e1117");
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/css/style.css?v=20260702-08">
 </head>
 <body>
   <header class="topbar">
@@ -14,6 +32,7 @@
       <button class="tool-btn layout-toggle" id="toggle-spaces" type="button" data-layout-panel="spaces" aria-pressed="true" aria-controls="spaces-panel">공간 접기</button>
       <button class="tool-btn layout-toggle" id="toggle-chat" type="button" data-layout-panel="chat" aria-pressed="true" aria-controls="chat-panel">채팅 접기</button>
       <button class="tool-btn layout-toggle" id="toggle-viewer" type="button" data-layout-panel="viewer" aria-pressed="true" aria-controls="viewer">뷰어 접기</button>
+      <button class="tool-btn theme-toggle" id="theme-toggle" type="button" title="라이트/다크 전환" aria-label="테마 전환">🌙</button>
     </div>
     <span id="status" class="status" title="서버 상태">●</span>
   </header>
@@ -55,21 +74,36 @@
         <button class="panel-collapse" type="button" data-layout-panel="chat" aria-controls="chat-panel">접기</button>
       </div>
       <section class="room-view" id="roomView">
-        <div class="room-head">
-          <div>
+        <div class="room-head" id="room-head">
+          <div class="room-head-main">
             <h2 id="room-title">공간을 선택하세요</h2>
-            <div class="room-sub">공간 카드의 열기 버튼으로 들어갑니다</div>
+            <div class="room-sub" id="room-sub">공간 카드의 열기 버튼으로 들어갑니다</div>
+            <div class="room-participants" id="room-participants" aria-label="참여 에이전트"></div>
           </div>
+          <label class="room-space-control" for="room-space-select">
+            <span>공간</span>
+            <select id="room-space-select" aria-label="공간 선택"></select>
+          </label>
           <div class="room-status" id="room-status" data-state="unknown">상태 없음</div>
           <form class="room-member-control" id="room-member-form" aria-label="공간 에이전트 입장">
             <select id="room-member-select" aria-label="입장시킬 에이전트"></select>
             <button class="ghost" id="room-member-join" type="submit">입장</button>
           </form>
+          <button class="ghost" id="room-monitor-btn" type="button" title="이 방을 관리자에이전트가 감시(목표·자기성장)">감시</button>
           <button class="ghost" id="room-refresh">새로고침</button>
+          <button class="ghost room-head-toggle" id="room-head-toggle" type="button" aria-expanded="true" aria-controls="room-head-compact">상단 접기</button>
+        </div>
+        <div class="room-head-compact" id="room-head-compact" hidden>
+          <div class="room-head-compact-main">
+            <strong id="room-compact-title">공간을 선택하세요</strong>
+            <span id="room-compact-status">상태 없음</span>
+          </div>
+          <button class="ghost" id="room-head-expand" type="button" aria-expanded="false" aria-controls="room-head">상단 펼치기</button>
         </div>
         <div class="room-diagnostics-toolbar" id="room-diagnostics-toolbar" aria-label="상태 영역 표시 설정">
           <button class="observer-toggle all" id="room-observer-all-toggle" type="button" aria-pressed="true" aria-controls="room-snapshot room-observer-stack">상태 접기</button>
           <div class="observer-section-toggles" aria-label="상태 섹션 표시">
+            <button class="observer-toggle" type="button" data-observer-section="watch" aria-pressed="true" aria-controls="room-watch-report">감시</button>
             <button class="observer-toggle" type="button" data-observer-section="snapshot" aria-pressed="true" aria-controls="room-snapshot">요약</button>
             <button class="observer-toggle" type="button" data-observer-section="status" aria-pressed="true" aria-controls="room-status-detail">상세</button>
             <button class="observer-toggle" type="button" data-observer-section="flow" aria-pressed="true" aria-controls="room-chat-flow">흐름</button>
@@ -83,6 +117,7 @@
         </div>
         <div class="room-snapshot" id="room-snapshot" data-failures="no"></div>
         <div class="room-observer-stack" id="room-observer-stack">
+          <section class="watch-report-panel" id="room-watch-report" data-empty="yes"></section>
           <div class="room-status-detail" id="room-status-detail" data-empty="yes"></div>
           <section class="chat-flow-panel" id="room-chat-flow" data-empty="yes"></section>
           <section class="obligation-panel" id="room-obligation-panel" data-empty="yes"></section>
@@ -94,10 +129,32 @@
             <div class="activity-empty">진행 상황 없음</div>
           </div>
         </div>
-        <div id="room-work-banner" class="room-work-banner" hidden></div>
+        <section class="room-monitor collapsed" id="room-monitor" aria-hidden="true" hidden>
+          <div class="room-monitor-head">
+            <span class="room-monitor-title">감시 <span class="room-monitor-meta" id="room-monitor-meta"></span></span>
+            <a class="ghost room-monitor-open" id="room-monitor-open" target="_blank" title="새 창에서 열기" hidden>↗</a>
+            <button class="ghost" id="room-monitor-toggle" type="button" title="접기/펴기">▴</button>
+            <button class="ghost" id="room-monitor-close" type="button" title="감시 세션 종료">✕</button>
+          </div>
+          <div class="room-monitor-frames" id="room-monitor-frames">
+            <iframe id="room-monitor-frame" class="room-monitor-frame" title="감시 터미널"></iframe>
+          </div>
+        </section>
+        <section id="room-work-panel" class="room-work-panel collapsed" hidden>
+          <div class="room-work-head">
+            <button id="room-work-banner" class="room-work-banner" type="button" aria-expanded="false" aria-controls="room-work-console">작업 상태 없음</button>
+            <a class="ghost room-work-open" id="room-work-open" target="_blank" rel="noopener" title="새 창에서 열기" hidden>↗</a>
+            <button class="ghost" id="room-work-toggle" type="button" title="작업 콘솔 접기/펴기">콘솔</button>
+          </div>
+          <div class="room-work-console" id="room-work-console" hidden>
+            <iframe id="room-work-frame" class="room-work-frame" title="작업 콘솔" hidden></iframe>
+            <div class="room-work-empty" id="room-work-empty">연결된 작업 콘솔 없음</div>
+          </div>
+        </section>
         <div class="room-messages" id="room-messages">
           <div class="room-empty">공간을 선택하세요</div>
         </div>
+        <button class="room-latest-btn" id="room-latest" type="button" title="최신 대화로 이동" hidden>↓ 최신</button>
         <input type="file" id="room-file" multiple class="hidden-file-input" aria-hidden="true" tabindex="-1">
         <form class="room-form" id="room-form">
           <div class="room-manager-lock">공간관리 항상 실행</div>
@@ -117,13 +174,14 @@
       </div>
       <div class="viewer-tabs">
         <button class="vtab active" data-view="filesView">파일</button>
-        <button class="vtab" data-view="casesView">케이스</button>
+        <button class="vtab" data-view="appsView">앱</button>
+        <button class="vtab" data-view="casesView">스킬</button>
       </div>
       <div class="views">
         <section class="view" id="casesView">
           <div class="cases-header">
             <button id="cases-refresh" class="ghost" type="button">새로고침</button>
-            <span class="cases-hint">스킬의 경우의 수(케이스)를 검토 — candidate 승인/강등/폐기, 결과 표시</span>
+            <span class="cases-hint">스킬 설명과 SKILL.md를 보고, 아래 케이스를 검토</span>
           </div>
           <div id="cases-review-banner" class="cases-review-banner" hidden></div>
           <div class="cases-split">
@@ -131,6 +189,15 @@
             <div class="cases-detail" id="cases-detail">
               <div class="empty">스킬을 선택하세요</div>
             </div>
+          </div>
+        </section>
+        <section class="view" id="appsView">
+          <div class="apps-header">
+            <button id="apps-refresh" class="ghost" type="button">새로고침</button>
+            <span class="apps-hint">앱/ 폴더의 애플리케이션 — 종류에 맞춰 실행·설치파일 다운로드·열기</span>
+          </div>
+          <div class="apps-list" id="apps-list">
+            <div class="empty">불러오는 중…</div>
           </div>
         </section>
         <section class="view active" id="filesView">
@@ -305,6 +372,6 @@
     </form>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20260629-30"></script>
+  <script type="module" src="/static/js/main.js?v=20260702-08"></script>
 </body>
 </html>

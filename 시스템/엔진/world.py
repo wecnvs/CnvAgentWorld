@@ -5,11 +5,12 @@
 도메인 로직은 전부 core/ 에 있다. 여기는 인자 파싱만 한다.
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core import chat_policy, people, spaces, engine, room_manager  # noqa: E402
+from core import chat_policy, people, spaces, engine, room_manager, watch  # noqa: E402
 
 
 def _show(_):
@@ -77,9 +78,32 @@ def main():
     a = sub.add_parser("space-tick"); a.add_argument("--space", required=True)
     a.set_defaults(fn=lambda x: print(room_manager.tick(x.space)))
 
+    a = sub.add_parser("recover", help="중단된 공간 진행을 복구·재개한다(시스템 변경/재시작 후 그 방을 문제없이 잇기). 살아있는 작업은 안 건드림.")
+    a.add_argument("--space", required=True)
+    a.set_defaults(fn=lambda x: print(json.dumps(room_manager.recover_space(x.space), ensure_ascii=False)))
+
+    a = sub.add_parser("recover-all", help="모든 공간의 중단된 진행을 복구·재개한다.")
+    a.set_defaults(fn=lambda x: print(json.dumps(room_manager.recover_stalled_spaces(), ensure_ascii=False)))
+
     a = sub.add_parser("work"); a.add_argument("--person", required=True); a.add_argument("--space", required=True)
     a.add_argument("--task", required=True); a.add_argument("--engine", default=None); a.add_argument("--model", default=None)
     a.set_defaults(fn=lambda x: print(engine.work(x.person, x.space, x.task, x.engine, x.model)))
+
+    a = sub.add_parser("watch-spec", help="단톡방 감시모드 세션 스펙(shell/cwd)을 출력한다(디버그/검증용).")
+    a.add_argument("--space", required=True); a.add_argument("--engine", default=None); a.add_argument("--model", default=None)
+    a.set_defaults(fn=lambda x: print(json.dumps(watch.build_watch_session(x.space, x.engine, x.model), ensure_ascii=False, indent=2)))
+
+    a = sub.add_parser("watch-report", help="감시 소견을 기록한다(대시보드 상태칩에 표시). 실제 평가만 적을 것.")
+    a.add_argument("--space", required=True)
+    a.add_argument("--goal", required=True, help="목표 달성: ok|warn|bad")
+    a.add_argument("--growth", required=True, help="집단지성 성장: ok|warn|bad")
+    a.add_argument("--goal-note", default=""); a.add_argument("--growth-note", default="")
+    a.add_argument("--summary", default="")
+    a.add_argument("--finding", action="append", default=[], help='"sev|텍스트" 형식, 여러 번 가능')
+    a.set_defaults(fn=lambda x: print(json.dumps(watch.write_report(
+        x.space, goal=x.goal, growth=x.growth, goal_note=x.goal_note,
+        growth_note=x.growth_note, summary=x.summary, findings=x.finding,
+    ), ensure_ascii=False, indent=2)))
 
     a = sub.add_parser("show"); a.set_defaults(fn=_show)
 

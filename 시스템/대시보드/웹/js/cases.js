@@ -1,9 +1,10 @@
-// 스킬 케이스(경우의 수) 검토 패널 — 대표가 candidate를 승인/강등/폐기하고 결과(worked/harmful)를 표시한다.
+// 스킬 검토 패널 — 스킬 설명/SKILL.md를 보고, 그 아래 케이스를 검토한다.
 // §9.1: 자동 격리된 모순(conflict)을 전 스킬 통합 배너로 노출하고, 조건 좁혀 분기(branch)로 해소한다.
-import { api } from "./api.js?v=20260629-30";
+import { api } from "./api.js?v=20260702-08";
 
 let selectedSkill = null;
 let reviewIndex = {};   // skill name -> { conflicts, review }
+let skillIndex = {};     // skill name -> list summary
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -32,11 +33,13 @@ export async function renderCases() {
     return (b.maturity?.cases || 0) - (a.maturity?.cases || 0);
   });
   listEl.innerHTML = "";
+  skillIndex = {};
   if (!skills.length) {
     listEl.append(el("li", "empty", "스킬 없음"));
     return;
   }
   skills.forEach((s) => {
+    skillIndex[s.name] = s;
     const li = el("li", "cases-skill-item");
     const m = s.maturity || {};
     const rv = reviewIndex[s.name] || {};
@@ -98,15 +101,32 @@ async function renderSkillDetail(skill) {
   const detail = document.getElementById("cases-detail");
   if (!detail) return;
   detail.innerHTML = "";
-  detail.append(el("div", "cases-detail-title", `${skill} — 케이스`));
-  detail.append(el("div", "cases-help",
-    "케이스는 만들어지면 다음부터 자동으로 사용됩니다(승인 불필요). 👍/👎는 에이전트 사용결과로 자동 집계되고, "
-    + "신뢰가 쌓이면 자동 승격됩니다. 대표님은 잘못된 케이스만 🗑 삭제하시면 됩니다."));
-  let data;
+  detail.append(el("div", "cases-detail-title", `${skill} — 스킬`));
+  const cached = skillIndex[skill] || {};
+  let data, info, detailError = "";
   try {
-    data = await api.skillCases(skill);
+    [info, data] = await Promise.all([api.skillDetail(skill), api.skillCases(skill)]);
   } catch (e) {
-    detail.append(el("div", "empty", "케이스 로드 실패: " + e.message));
+    try {
+      data = await api.skillCases(skill);
+    } catch (caseError) {
+      detail.append(el("div", "empty", "스킬 로드 실패: " + caseError.message));
+      return;
+    }
+    detailError = e.message;
+  }
+  if (selectedSkill !== skill) return;
+  const meta = { ...cached, ...(info || {}) };
+  detail.append(renderSkillSummary(meta, data, detailError));
+  detail.append(el("div", "cases-help",
+    "케이스는 이 스킬 아래에 쌓이는 경우의 수입니다. 만들어지면 다음부터 자동으로 사용되고, "
+    + "신뢰가 쌓이면 자동 승격됩니다. 대표님은 잘못된 케이스만 삭제하시면 됩니다."));
+  detail.append(el("div", "cases-section-title", "케이스"));
+  if (detailError) {
+    detail.append(el("div", "cases-load-note", "SKILL.md 로드 실패: " + detailError));
+  }
+  if (!data) {
+    detail.append(el("div", "empty", "케이스 로드 실패"));
     return;
   }
   const cases = data.cases || [];
@@ -184,6 +204,32 @@ async function renderSkillDetail(skill) {
 
     detail.append(card);
   });
+}
+
+function renderSkillSummary(info, data, detailError = "") {
+  const box = el("div", "skill-summary");
+  const head = el("div", "skill-summary-head");
+  head.append(el("span", "skill-summary-name", info.name || data.skill || selectedSkill || ""));
+  if (info.grade) head.append(el("span", "case-badge", info.grade));
+  const maturity = data?.maturity || info.maturity || {};
+  head.append(el("span", "case-badge", `케이스 ${maturity.cases || 0}`));
+  if (maturity.version) head.append(el("span", "case-badge", `v${maturity.version}`));
+  if (maturity.warn_harmful) head.append(el("span", "case-badge review", `harmful ${maturity.harmful || 0}`));
+  box.append(head);
+
+  const desc = el("div", "skill-description", info.description || "frontmatter description이 비어 있습니다.");
+  box.append(desc);
+  if (info.path) box.append(el("div", "skill-path", info.path));
+
+  const source = el("details", "skill-source");
+  const summary = el("summary", "skill-source-summary", "SKILL.md 보기");
+  source.append(summary);
+  const pre = el("pre", "skill-source-code");
+  const code = el("code", "", detailError ? "SKILL.md를 읽을 수 없습니다." : (info.content || ""));
+  pre.append(code);
+  source.append(pre);
+  box.append(source);
+  return box;
 }
 
 // 모순을 '병합·삭제' 말고 조건 좁혀 분기(more-specific-wins). 대표가 좁힐 키워드를 직접 준다.
