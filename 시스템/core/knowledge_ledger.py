@@ -205,3 +205,70 @@ def claim_review_queue(name_or_dir) -> list[dict]:
             last = [e for e in events if e.get("claim_id") == cid][-1]
             out.append({"claim_id": cid, "status": "disputed", "reason": last.get("rationale", ""), "by": last.get("by", "")})
     return out
+
+
+# --- P3'/P4 지식 dispute 입구: claim 텍스트에서 안정 id 파생 + '틀렸다' 반박 채널 ---
+# create_knowledge는 claim을 '- 텍스트' 줄로만 append(개별 id 없음)라, dispute 함수가 참조할 id가 없었다.
+# claim_id = 텍스트 정규화 해시로 파생 → 본문 불변, 이벤트로만 disputed 표시(harmful 패턴의 지식판).
+def claim_id_for(text: str) -> str:
+    import hashlib
+    norm = re.sub(r"\s+", " ", str(text or "")).strip()
+    return "claim_" + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def list_claims(name_or_dir) -> list[dict]:
+    """지식 본문의 claim 줄들을 파생 id·상태와 함께 반환(주입·dispute 참조용).
+
+    **'사실' 섹션(## 범용 사실 / ## 조건부 사실)의 불릿만** claim으로 본다 — '## 참조 방법' 같은 산문
+    섹션의 불릿을 사실로 오추출하지 않게(크로스체크 지적). status는 이벤트를 1회만 읽어 파생(claim마다 재파싱 방지).
+    """
+    kdir = _resolve_dir(name_or_dir)
+    manifest = kdir / "지식.md"
+    if not manifest.exists():
+        return []
+    # 이벤트 1회 읽어 claim_id별 최종 status 파생(마지막 이벤트 승 — claim_status와 동일 규칙).
+    status_by_id: dict = {}
+    for e in _read_events(kdir):
+        cid = e.get("claim_id"); ev = e.get("event")
+        if not cid:
+            continue
+        if ev == "dispute":
+            status_by_id[cid] = "disputed"
+        elif ev in ("verify", "resolve"):
+            status_by_id[cid] = "active"
+    out = []
+    section = ""
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^\s*##\s+(.*\S)\s*$", line)
+        if m:
+            section = m.group(1)
+            continue
+        if "사실" not in section:                          # 사실 섹션 불릿만 claim(산문 섹션 제외)
+            continue
+        cm = re.match(r"^\s*-\s+(.*\S)\s*$", line)
+        if cm:
+            text = cm.group(1)
+            cid = claim_id_for(text)
+            out.append({"claim_id": cid, "text": text, "section": section,
+                        "status": status_by_id.get(cid, "provisional")})
+    return out
+
+
+def dispute(name_or_dir, *, claim_text: str = "", claim_id: str = "", by: str, rationale: str) -> dict:
+    """'이 지식 사실이 틀렸다' 반박 채널. claim_text(본문 매칭) 또는 claim_id로 대상 지정.
+
+    본문은 안 바꾸고 이벤트만(→ disputed). claim_text가 본문 claim과 안 맞으면 그 텍스트 해시로라도
+    dispute를 남긴다(추적 보존). 매니저/대표 정정·에이전트 보고 공용 입구.
+    """
+    cid = str(claim_id or "").strip()
+    if not cid:
+        if not str(claim_text or "").strip():
+            raise KnowledgeLedgerError("dispute는 claim_text 또는 claim_id 필요")
+        # 본문에서 매칭되는 claim의 파생 id 우선, 없으면 텍스트 해시
+        want = claim_id_for(claim_text)
+        cid = want
+        for c in list_claims(name_or_dir):
+            if c["claim_id"] == want or claim_text.strip() in c["text"] or c["text"] in claim_text:
+                cid = c["claim_id"]
+                break
+    return dispute_claim(name_or_dir, cid, by=by, rationale=rationale)

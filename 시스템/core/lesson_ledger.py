@@ -1640,12 +1640,33 @@ def audit_reply_lesson_applications(
             except Exception:
                 continue   # 점진 도입 fail-safe: 케이스 기록 실패가 발행을 막지 않는다
 
+    # 지식 반박 자기보고 → dispute 이벤트(P3'/P4 지식 dispute 입구). 본문 불변, 깃발만. 발행 안 막음.
+    knowledge_dispute_rows = []
+    raw_kdisputes = obj.get("knowledge_disputes")
+    if isinstance(raw_kdisputes, list):
+        from . import knowledge_ledger
+        for item in raw_kdisputes:
+            if not isinstance(item, dict):
+                continue
+            kname = str(item.get("knowledge") or "").strip()
+            cid = str(item.get("claim_id") or "").strip()
+            why = str(item.get("why") or item.get("reason") or "").strip()
+            if not kname or (not cid and not item.get("claim_text")):
+                continue
+            try:
+                knowledge_ledger.dispute(kname, claim_id=cid, claim_text=str(item.get("claim_text") or ""),
+                                         by=agent, rationale=(why or "에이전트 반박: 현실과 불일치")[:240])
+                knowledge_dispute_rows.append({"knowledge": kname, "claim_id": cid or "(by_text)"})
+            except Exception:
+                continue   # fail-safe: 지식 dispute 실패가 발행을 막지 않는다
+
     return {
         "content": clean_content if report_found and stripped else str(content or ""),
         "report_found": report_found,
         "must_apply": must_ids,
         "applications": application_rows,
         "case_applications": case_application_rows,
+        "knowledge_disputes": knowledge_dispute_rows,
     }
 
 

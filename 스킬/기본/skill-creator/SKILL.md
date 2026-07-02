@@ -704,6 +704,14 @@ In Claude.ai, the core workflow is the same (draft → test → review → impro
 
 ---
 
+## CnvAgentWorld 전용 — 새 스킬엔 첫 케이스를 씨딩하라
+
+이 워크스페이스의 스킬은 **SKILL.md(불변 본문) + cases.jsonl(상황별 케이스 누적)**로 성장한다. 새 스킬을 만들면 케이스가 0인데, **케이스 0 스킬은 발견 시 '신규(미검증)'로 신뢰도가 낮게 노출**된다. 그래서 스킬을 만든 직접적 계기(그 스킬을 만들게 한 첫 상황·교훈)를 **첫 케이스로 씨딩**한다:
+
+- 방법: `python3 -c "import sys; sys.path.insert(0,'시스템'); from core import case_ledger; case_ledger.propose_case('<스킬이름>', {...})"` 또는 사회자/관리자 경로의 `propose_case`. 필수 4필드(polarity=worked/failed·action=add_case·judgment_rationale·source_quote) + condition('언제')·instruction('그땐 이렇게'·역할/패턴으로 일반화, PII 금지).
+- 손으로 cases.jsonl을 편집하지 않는다 — propose_case가 판단계약·민감도 라우팅·자원락·안정 case_id를 보장한다.
+- 첫 케이스가 있으면 다음에 이 스킬이 발견될 때 그 경우의 수가 주입돼 바로 도움이 된다(케이스 0 공백 방지).
+
 ## Cowork-Specific Instructions
 
 If you're in Cowork, the main things to know are:

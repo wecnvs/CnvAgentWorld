@@ -61,8 +61,21 @@ def collect(kinds: list[str]) -> list[dict]:
             }
             if kind == "skill":
                 _attach_skill_growth(item, manifest.parent)
+            elif kind == "knowledge":
+                _attach_knowledge_claims(item, manifest.parent)
             items.append(item)
     return items
+
+
+def _attach_knowledge_claims(item: dict, kdir) -> None:
+    """지식 후보에 claim(사실) 목록 + id·상태를 붙인다 — 에이전트가 '이 사실이 틀렸다'를 claim_id로 보고하게(P3'/P4 dispute 입구)."""
+    try:
+        from . import knowledge_ledger
+        claims = knowledge_ledger.list_claims(kdir)
+        # disputed는 caution으로, 나머지는 그대로. 너무 많으면 앞 6개만.
+        item["knowledge_claims"] = claims[:6]
+    except Exception:
+        pass
 
 
 def _attach_skill_growth(item: dict, sdir) -> None:
@@ -208,5 +221,13 @@ def render_context(query: str, hits: list[tuple[int, dict]]) -> str:
                 tag = {"must_avoid": "반드시 피하라", "avoid": "피하라", "caution": "주의"}.get(a.get("strength", ""), "주의")
                 why = "격리된 모순" if a.get("kind") == "conflict" else "실패 사례"
                 lines.append(f"    · [{tag}/{why}] {a.get('condition','')} → {a.get('instruction','')}")
+        kclaims = item.get("knowledge_claims", [])
+        if kclaims:
+            lines.append("- 사실(참고 — 현실과 다르면 반드시 보고):")
+            for c in kclaims:
+                flag = " ⚠️disputed" if c.get("status") == "disputed" else ""
+                lines.append(f"    · [{c.get('claim_id','')}]{flag} {c.get('text','')}")
+            lines.append("    (이 지식의 사실이 현실과 안 맞았다면 답변 끝 JSON에 "
+                         "knowledge_disputes:[{knowledge, claim_id, why}]로 보고하라 — 틀린 지식을 고치는 유일한 입구다.)")
         lines.append("")
     return "\n".join(lines).rstrip()
