@@ -82,6 +82,54 @@ def review_all():
     return {"total_conflicts": total_conflicts, "total_review": total_review, "skills": skills_out}
 
 
+@router.get("/promotions")
+def promotion_backlog():
+    """승격 대기(candidate/provisional_must) 백로그 — 대표 원클릭 승격용.
+
+    감사 실증(2026-07-02): 케이스 100줄 중 75줄이 candidate 적체 — 발의는 활발한데 확정(active)이
+    병목이라 집단지성이 '쌓이기만 하고 전파되지 않는' 상태였다. 준비완료(ready_to_promote: worked
+    수렴)를 앞세워 정렬하되, 대표 승인(owner_approval)은 worked 가드 면제이므로 전체 candidate를
+    노출해 대표가 훑고 바로 승격/폐기하게 한다. (/{skill} 경로보다 먼저 선언해야 붙잡히지 않는다.)
+    """
+    items = []
+    ready_count = 0
+    for s in skill_smith.list_skills():
+        name = s.get("name", "")
+        sdir = case_ledger.skill_dir(name)
+        if not sdir:
+            continue
+        try:
+            conv = {c.get("case_id"): c for c in case_ledger.case_convergence(sdir, include_local=False)}
+            # 대외비 사이드카(cases.local.jsonl)는 HTTP 응답에 싣지 않는다 — 무인증 API 유출 차단
+            # (크로스체크 CRITICAL-2). 내부 주입(발견기)은 include_local=True로 계속 읽는다.
+            cases = case_ledger.read_cases(sdir, include_local=False)
+        except case_ledger.CaseLedgerError:
+            continue
+        for case in cases:
+            if case.get("status") not in {"candidate", "provisional_must"}:
+                continue
+            cid = case.get("case_id", "")
+            cv = conv.get(cid) or {}
+            ready = bool(cv.get("ready_to_promote"))
+            if ready:
+                ready_count += 1
+            items.append({
+                "skill": name,
+                "case_id": cid,
+                "status": case.get("status", ""),
+                "polarity": case.get("polarity", ""),
+                "condition": str(case.get("condition") or "")[:200],
+                "instruction": str(case.get("instruction") or "")[:300],
+                "worked": cv.get("worked", 0),
+                "harmful": cv.get("harmful", 0),
+                "ready_to_promote": ready,
+                "needs_review": bool(cv.get("needs_review")),
+                "created_at": case.get("created_at", ""),
+            })
+    items.sort(key=lambda r: (not r["ready_to_promote"], -(r["worked"] or 0), r["skill"]))
+    return {"total": len(items), "ready_count": ready_count, "items": items}
+
+
 @router.get("/{skill}")
 def skill_detail(skill: str):
     """선택한 스킬의 frontmatter 설명과 SKILL.md 원문을 대시보드에 제공한다."""
@@ -94,12 +142,15 @@ def skill_detail(skill: str):
 @router.get("/{skill}/cases")
 def list_cases(skill: str):
     sdir = _sdir(skill)
-    cases = [c for c in case_ledger.read_cases(sdir) if c.get("status") not in case_ledger.DEAD_STATUSES]
+    # 대외비 사이드카는 HTTP로 내보내지 않는다(include_local=False) — 무인증 API 유출 차단(CRITICAL-2).
+    # review_queue/convergence는 case_id+집계 카운트만 내므로(텍스트 無) 그대로 둔다.
+    cases = [c for c in case_ledger.read_cases(sdir, include_local=False)
+             if c.get("status") not in case_ledger.DEAD_STATUSES]
     return {
         "skill": skill,
         "maturity": case_ledger.maturity(sdir),
         "review_queue": case_ledger.review_queue(sdir),
-        "convergence": case_ledger.case_convergence(sdir),
+        "convergence": case_ledger.case_convergence(sdir, include_local=False),
         "evaluator_reliability": case_ledger.evaluator_reliability(sdir),
         "cases": cases,
     }

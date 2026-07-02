@@ -215,6 +215,23 @@ def write_guide(space: str, text: str) -> dict:
     return {"ok": True}
 
 
+def read_summary(space: str) -> dict:
+    """방 누적 요약(요약.md) 읽기 — 대시보드 '방요약' 패널용(조회 전용).
+
+    요약.md는 사회자·시스템이 유지하는 방 맥락의 정본인데 종전엔 UI 어디에서도 보여주지 않아,
+    대표가 '방이 맥락을 제대로 요약·이해하고 있는지'를 확인할 길이 없었다(목표.md 요구 9의 가시화)."""
+    sdir = _safe_space_dir(space)
+    p = sdir / "요약.md"
+    if not p.exists():
+        return {"summary": "", "updated_at": ""}
+    try:
+        from datetime import datetime
+        mtime = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")
+    except Exception:
+        mtime = ""
+    return {"summary": p.read_text(encoding="utf-8"), "updated_at": mtime}
+
+
 def join(person: str, space: str) -> bool:
     pdir = _safe_person_dir(person)
     sdir = _safe_space_dir(space)

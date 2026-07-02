@@ -1,5 +1,5 @@
 // 에이전트 패널 렌더링과 동작.
-import { api } from "./api.js?v=20260702-08";
+import { api } from "./api.js?v=20260702-13";
 
 let engineCatalog = null;
 
@@ -86,7 +86,9 @@ export async function renderPeople() {
           data-runner-timeout-sec="${esc(p.작업설정?.runner_timeout_sec || 300)}"
           data-heartbeat-interval-sec="${esc(p.작업설정?.heartbeat_interval_sec || 10)}"
           data-heartbeat-stale-ms="${esc(p.작업설정?.heartbeat_stale_ms || 60000)}"
-          data-progress-report-due-ms="${esc(p.작업설정?.progress_report_due_ms || 60000)}">작업 실행설정 수정</button>
+          data-progress-report-due-ms="${esc(p.작업설정?.progress_report_due_ms || 60000)}"
+          data-progress-bubble-after-ms="${esc(p.작업설정?.progress_bubble_after_ms ?? 120000)}"
+          data-progress-bubble-interval-ms="${esc(p.작업설정?.progress_bubble_interval_ms ?? 300000)}">작업 실행설정 수정</button>
         <button class="edit-btn person-role-btn" data-person="${esc(p.토큰)}">role 수정</button>
         <button class="edit-btn danger person-delete-btn" data-person="${esc(p.토큰)}" data-name="${esc(p.이름)}">삭제</button>
       </div>
@@ -224,11 +226,15 @@ export async function openWorkSettingsModal(title, settings = {}, options = {}) 
     { key: "heartbeat_interval_sec", input: "edit-heartbeat-interval", checkbox: "edit-heartbeat-interval-override", datasetKey: "heartbeatIntervalSec", fallback: 10 },
     { key: "heartbeat_stale_ms", input: "edit-heartbeat-stale", checkbox: "edit-heartbeat-stale-override", datasetKey: "heartbeatStaleMs", fallback: 60000 },
     { key: "progress_report_due_ms", input: "edit-progress-due", checkbox: "edit-progress-due-override", datasetKey: "progressReportDueMs", fallback: 60000 },
+    { key: "progress_bubble_after_ms", input: "edit-progress-bubble-after", checkbox: "edit-progress-bubble-after-override", datasetKey: "progressBubbleAfterMs", fallback: 120000 },
+    { key: "progress_bubble_interval_ms", input: "edit-progress-bubble-interval", checkbox: "edit-progress-bubble-interval-override", datasetKey: "progressBubbleIntervalMs", fallback: 300000 },
   ];
   fields.forEach((field) => {
     const input = document.getElementById(field.input);
     const checkbox = document.getElementById(field.checkbox);
-    input.value = settings[field.datasetKey] || settings[field.key] || field.fallback;
+    // 0도 유효값(진행보고 끔) — falsy 폴백(||)이면 0이 기본값으로 둔갑한다
+    const raw = settings[field.datasetKey] ?? settings[field.key];
+    input.value = (raw === undefined || raw === null || raw === "") ? field.fallback : raw;
     checkbox.checked = partial ? configuredKeys.has(field.key) : true;
     checkbox.closest(".work-override-row").hidden = !partial;
   });

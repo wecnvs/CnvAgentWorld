@@ -40,6 +40,8 @@ class WorkSettingsUpdate(BaseModel):
     heartbeat_interval_sec: int | None = None
     heartbeat_stale_ms: int | None = None
     progress_report_due_ms: int | None = None
+    progress_bubble_after_ms: int | None = None
+    progress_bubble_interval_ms: int | None = None
     configured_keys: list[str] | None = None
 
 
@@ -161,6 +163,12 @@ def read_guide(space: str):
 @router.put("/{space}/guide")
 def write_guide(space: str, body: TextUpdate):
     return spaces.write_guide(space, body.text)
+
+
+@router.get("/{space}/summary")
+def read_summary(space: str):
+    """방 누적 요약(요약.md) — '방요약' 패널용 조회 전용."""
+    return spaces.read_summary(space)
 
 
 @router.get("/{space}/messages")

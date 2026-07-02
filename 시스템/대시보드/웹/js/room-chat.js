@@ -1,8 +1,8 @@
 // 공간 채팅방 보기와 입력.
-import { api } from "./api.js?v=20260702-08";
-import { openWorkSettingsModal, openRuntimeModal } from "./people.js?v=20260702-08";
-import { setLayoutPanelCollapsed } from "./viewer.js?v=20260702-08";
-import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260702-08";
+import { api } from "./api.js?v=20260702-13";
+import { openWorkSettingsModal, openRuntimeModal } from "./people.js?v=20260702-13";
+import { setLayoutPanelCollapsed } from "./viewer.js?v=20260702-13";
+import { pauseFileWatch, resumeFileWatch } from "./files.js?v=20260702-13";
 
 let currentSpace = "";
 let refreshTimer = null;
@@ -43,6 +43,7 @@ const observerSections = [
   ["task", "room-task-panel"],
   ["candidate", "room-candidate-panel"],
   ["promotion", "room-promotion-review"],
+  ["roomsummary", "room-summary-panel"],
   ["activity", "room-activity"],
 ];
 
@@ -509,6 +510,49 @@ function setupAttachUpload() {
     resumePolling();
     input.focus();
   };
+
+  // 폴더 통째 첨부(🗂) — webkitdirectory로 선택한 폴더의 하위 구조를 inbox에 보존 업로드하고,
+  // 말풍선에는 폴더 경로 한 줄만 넣는다(파일 수백 개가 본문을 도배하지 않게).
+  const folderBtn = document.getElementById("room-attach-folder");
+  const folderInput = document.getElementById("room-folder");
+  if (folderBtn && folderInput) {
+    folderBtn.addEventListener("click", (e) => {
+      if (!currentSpace) { e.preventDefault(); alert("먼저 공간을 여세요."); return; }
+      pausePolling();
+    });
+    folderBtn.addEventListener("keydown", (e) => {
+      if ((e.key === "Enter" || e.key === " ") && currentSpace) {
+        e.preventDefault(); pausePolling(); folderInput.click();
+      }
+    });
+    folderInput.onchange = async () => {
+      const files = [...folderInput.files];
+      folderInput.value = "";
+      if (!currentSpace || !files.length) { resumePolling(); return; }
+      const prev = folderBtn.textContent;
+      folderBtn.disabled = true;
+      let done = 0, failed = 0;
+      const rootRel = (files[0].webkitRelativePath || "").split("/")[0] || "";
+      for (const f of files) {
+        folderBtn.textContent = `⏳${done + failed + 1}/${files.length}`;
+        try {
+          await api.uploadFile(`공간/${currentSpace}/inbox`, f, f.webkitRelativePath || f.name);
+          done += 1;
+        } catch (e) {
+          failed += 1;
+          if (failed === 1) alert(`업로드 실패(${f.name}): ${e.message} — 나머지는 계속 시도합니다.`);
+        }
+      }
+      folderBtn.disabled = false; folderBtn.textContent = prev;
+      if (done) {
+        const folderPath = rootRel ? `공간/${currentSpace}/inbox/${rootRel}/` : `공간/${currentSpace}/inbox/`;
+        input.value = (input.value ? input.value.replace(/\s*$/, "") + "\n" : "")
+          + `${folderPath} (폴더 첨부 — 파일 ${done}개${failed ? `, 실패 ${failed}개` : ""})`;
+      }
+      resumePolling();
+      input.focus();
+    };
+  }
 }
 
 function openImageLightbox(src) {
@@ -1616,6 +1660,49 @@ function candidateSortKey(item) {
   if (Number.isFinite(time)) return time;
   const index = Number(item._row_index);
   return Number.isFinite(index) ? index : 0;
+}
+
+// ── 방요약(요약.md) 패널 — 방의 누적 맥락 정본을 대표가 UI에서 바로 본다(종전엔 파일 뷰어로만 가능) ──
+const SUMMARY_REFRESH_MS = 10000;
+let lastSummaryFetchMs = 0;
+let summaryFetchInFlight = false;
+
+function renderRoomSummary(data) {
+  const panel = document.getElementById("room-summary-panel");
+  if (!panel) return;
+  const text = String((data && data.summary) || "").trim();
+  if (!text || text === "(아직 요약 없음)") {
+    panel.dataset.empty = "yes";
+    panel.innerHTML = "";
+    return;
+  }
+  panel.dataset.empty = "no";
+  const updated = data && data.updated_at
+    ? `<span class="room-summary-updated">갱신 ${esc(String(data.updated_at).replace("T", " "))}</span>` : "";
+  panel.innerHTML = `
+    <div class="room-summary-head">방요약(요약.md) ${updated}</div>
+    <pre class="room-summary-body">${esc(text)}</pre>
+  `;
+}
+
+async function maybeRefreshRoomSummary(space) {
+  const panel = document.getElementById("room-summary-panel");
+  if (!panel) return;
+  // 접혀 있으면 폴링 비용 자체를 아낀다(모바일 기본 접힘 — 채팅 우선 원칙 유지).
+  if (observerCollapsed || collapsedObserverSections.has("roomsummary")) return;
+  const nowMs = Date.now();
+  if (summaryFetchInFlight || nowMs - lastSummaryFetchMs < SUMMARY_REFRESH_MS) return;
+  summaryFetchInFlight = true;
+  try {
+    const data = await api.spaceSummary(space);
+    if (space !== currentSpace) return;
+    lastSummaryFetchMs = Date.now();
+    renderRoomSummary(data);
+  } catch (_) {
+    // 요약 조회 실패는 치명적이지 않다 — 다음 주기에 재시도.
+  } finally {
+    summaryFetchInFlight = false;
+  }
 }
 
 function renderCandidatePanel(st = {}) {
@@ -2799,6 +2886,7 @@ async function refreshRoomStatus(options = {}) {
       renderTaskPanel(st);
       renderCandidatePanel(st);
       renderPromotionReviewPanel(st);
+      maybeRefreshRoomSummary(space);
       applyObserverVisibility();
     }
     renderMessages(lastMessageRows);
@@ -2852,6 +2940,8 @@ export async function openSpaceChat(space) {
   lastHeavyRenderMs = 0;   // 새 공간은 무거운 패널을 즉시 한 번 렌더
   lastActivityFetchMs = 0;
   lastActivitySpace = "";
+  lastSummaryFetchMs = 0;  // 방요약도 새 공간에서 즉시 다시 읽는다
+  renderRoomSummary(null);
   document.getElementById("room-title").textContent = space;
   document.getElementById("room-input").value = "";
   resetWorkPanel();

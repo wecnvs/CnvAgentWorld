@@ -18,14 +18,35 @@ from shells import default_shell, shell_candidates
 from terminal_session import set_main_loop
 from uploads import save_raw_upload
 
+import auth_guard
+
 app = FastAPI(title="CnvAgentWorld Terminal Server")
+# allow_credentials=True + "*" 조합은 금지 패턴(자격증명 실린 교차출처 요청 허용) — 쿠키는
+# 같은 출처(iframe 내 직접 탐색)로만 흐르면 되므로 credentials 없이 개방한다.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class AuthGuard(BaseHTTPMiddleware):
+    """옵트인 접근 토큰 가드 — 토큰 파일이 있을 때만 활성, 루프백 통과 (auth_guard.py)."""
+
+    async def dispatch(self, request, call_next):
+        ok, set_cookie = auth_guard.check_request(request)
+        if not ok:
+            return JSONResponse(status_code=401, content={"detail": "인증 필요 — ?auth=<토큰>으로 1회 접속"})
+        resp = await call_next(request)
+        if set_cookie:
+            resp.set_cookie(auth_guard.COOKIE_NAME, auth_guard.load_token(),
+                            max_age=365 * 24 * 3600, httponly=True, samesite="lax")
+        return resp
+
+
+app.add_middleware(AuthGuard)
 
 
 class NoCache(BaseHTTPMiddleware):
@@ -122,6 +143,11 @@ async def api_upload(request: Request):
 
 @app.websocket("/ws/{sid}")
 async def ws_attach(ws: WebSocket, sid: str):
+    # HTTP 미들웨어는 WS 핸드셰이크를 못 거르므로 여기서 직접 검사(쿠키/쿼리, 루프백 통과).
+    ok, _ = auth_guard.check_request(ws)
+    if not ok:
+        await ws.close(code=4401)
+        return
     await ws.accept()
     sess = registry.get_session(sid)
     if not sess:

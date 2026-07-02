@@ -211,7 +211,9 @@ class DashboardStaticTests(unittest.TestCase):
         self.assertIn("edit-runner-timeout-override", people_js)
         self.assertIn("체크한 항목만", people_js)
         self.assertIn("datasetKey: \"runnerTimeoutSec\"", people_js)
-        self.assertIn("input.value = settings[field.datasetKey] || settings[field.key] || field.fallback", people_js)
+        # 0도 유효값(진행보고 끔) — falsy(||) 폴백이면 0이 기본값으로 둔갑하므로 ?? 기반 대입이어야 한다
+        self.assertIn("const raw = settings[field.datasetKey] ?? settings[field.key]", people_js)
+        self.assertIn('datasetKey: "progressBubbleIntervalMs"', people_js)
         self.assertIn("values[field.key] = Number(document.getElementById(field.input).value", people_js)
         self.assertIn("selected.push(field.key)", people_js)
         self.assertIn("data-task-action=\"settings\"", room_js)
@@ -575,6 +577,36 @@ class DashboardStaticTests(unittest.TestCase):
         self.assertIn("api.scanLessonPromotions", room)
         self.assertIn("api.approveLessonPromotion", room)
         self.assertIn("api.rejectLessonPromotion", room)
+
+    def test_local_macos_capture_fails_loudly_without_screen_recording_permission(self):
+        screenshot = (ROOT / "도구/기본/cu-mac/screenshot.py").read_text(encoding="utf-8")
+        remote = (ROOT / "시스템/대시보드/웹/js/remote-panel.js").read_text(encoding="utf-8")
+        ctl = (ROOT / "시스템/대시보드/서버/ctl.sh").read_text(encoding="utf-8")
+        terminal_launcher = (ROOT / "시스템/대시보드/서버/start-with-screen-permission.command").read_text(encoding="utf-8")
+
+        self.assertIn("CGPreflightScreenCaptureAccess", screenshot)
+        self.assertIn("CGRequestScreenCaptureAccess", screenshot)
+        self.assertIn("화면 녹화 권한 없음", screenshot)
+        self.assertIn("오인 방지를 위해 캡처를 중단", screenshot)
+        self.assertIn("sys.exit(2)", screenshot)
+
+        self.assertIn("screenshotError", remote)
+        self.assertIn("screenFailureMessage", remote)
+        self.assertIn("data.detail", remote)
+        self.assertIn("macOS 화면 녹화 권한 필요", remote)
+
+        self.assertIn("terminal_start", ctl)
+        self.assertIn("start-with-screen-permission.command", ctl)
+        self.assertIn("open -a Terminal", ctl)
+        self.assertIn("wait_terminal_launch", ctl)
+        self.assertIn("permission_failed", ctl)
+        self.assertIn("execing", ctl)
+        self.assertIn("The Terminal launcher performs the permission gate before stopping the old server", ctl)
+        self.assertIn("Screen Recording precheck", terminal_launcher)
+        self.assertIn("write_status", terminal_launcher)
+        self.assertIn("CNV_DASHBOARD_LAUNCH_STATUS", terminal_launcher)
+        self.assertIn("The existing :$PORT server was not stopped", terminal_launcher)
+        self.assertIn("/api/cu/view/status?target=local", terminal_launcher)
 
 
 if __name__ == "__main__":

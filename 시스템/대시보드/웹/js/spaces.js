@@ -1,7 +1,7 @@
 // 공간 패널 렌더링과 동작(생성·입장).
-import { api } from "./api.js?v=20260702-08";
-import { clearSpaceChatIfCurrent, openSpaceChat, refreshCurrentRoomParticipants } from "./room-chat.js?v=20260702-08";
-import { openPersonPickerModal, openRuntimeModal, openTextModal, openWorkSettingsModal } from "./people.js?v=20260702-08";
+import { api } from "./api.js?v=20260702-13";
+import { clearSpaceChatIfCurrent, openSpaceChat, refreshCurrentRoomParticipants } from "./room-chat.js?v=20260702-13";
+import { openPersonPickerModal, openRuntimeModal, openTextModal, openWorkSettingsModal } from "./people.js?v=20260702-13";
 
 let engineCatalog = null;
 
@@ -59,7 +59,9 @@ function seatWorkSettingsPanel(space, members = []) {
           data-runner-timeout-sec="${esc(settings.runner_timeout_sec || 300)}"
           data-heartbeat-interval-sec="${esc(settings.heartbeat_interval_sec || 10)}"
           data-heartbeat-stale-ms="${esc(settings.heartbeat_stale_ms || 60000)}"
-          data-progress-report-due-ms="${esc(settings.progress_report_due_ms || 60000)}">${esc(label)}</button>
+          data-progress-report-due-ms="${esc(settings.progress_report_due_ms || 60000)}"
+          data-progress-bubble-after-ms="${esc(settings.progress_bubble_after_ms ?? 120000)}"
+          data-progress-bubble-interval-ms="${esc(settings.progress_bubble_interval_ms ?? 300000)}">${esc(label)}</button>
       `,
       };
     });
@@ -100,7 +102,9 @@ export async function renderSpaces() {
           data-runner-timeout-sec="${esc(s.작업설정?.runner_timeout_sec || 300)}"
           data-heartbeat-interval-sec="${esc(s.작업설정?.heartbeat_interval_sec || 10)}"
           data-heartbeat-stale-ms="${esc(s.작업설정?.heartbeat_stale_ms || 60000)}"
-          data-progress-report-due-ms="${esc(s.작업설정?.progress_report_due_ms || 60000)}">작업 실행설정 수정</button>
+          data-progress-report-due-ms="${esc(s.작업설정?.progress_report_due_ms || 60000)}"
+          data-progress-bubble-after-ms="${esc(s.작업설정?.progress_bubble_after_ms ?? 120000)}"
+          data-progress-bubble-interval-ms="${esc(s.작업설정?.progress_bubble_interval_ms ?? 300000)}">작업 실행설정 수정</button>
         <button class="edit-btn space-guide-btn" data-space="${esc(s.토큰)}">공간지침 수정</button>
         <button class="edit-btn danger space-delete-btn" data-space="${esc(s.토큰)}" data-name="${esc(s.이름)}">삭제</button>
       </div>

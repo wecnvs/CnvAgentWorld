@@ -1,5 +1,5 @@
 // 파일 탐색기: breadcrumb + 리스트 + 미리보기. 모든 경로는 루트폴더 기준.
-import { api } from "./api.js?v=20260702-08";
+import { api } from "./api.js?v=20260702-13";
 
 const ICONS = {
   md: "📝", txt: "📄", py: "🐍", js: "⭐", ts: "⭐", json: "🧾", jsonl: "🧾",

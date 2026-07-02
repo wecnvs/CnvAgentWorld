@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from .paths import PEOPLE, ENGINE_ENTRY
 from .codes import gen_code
-from . import discovery, runtime, task_registry, templates, work_settings
+from . import discovery, injection_log, runtime, task_registry, templates, work_settings
 from .transcript import now_iso
 
 
@@ -43,15 +43,33 @@ def discovery_context(query: str, top: int = 5) -> str:
     return discovery.render_context(query, hits)
 
 
-def prompt_with_discovery(query: str, prompt: str) -> str:
-    context = discovery_context(query)
+def prompt_with_discovery(query: str, prompt: str, *, log_space: str = "", log_ref: str = "",
+                          log_kind: str = "chat", log_context: dict | None = None) -> str:
+    """발견 컨텍스트를 프롬프트 앞에 붙인다. log_space+log_ref가 주어지면 주입된 케이스를 기록한다(P1').
+
+    (기존 2-인자 호출은 그대로 동작 — 로깅은 옵트인이라 무회귀.)
+    """
+    hits = discovery.find(query, "all", 5)
+    context = discovery.render_context(query, hits)
+    if log_space and log_ref:
+        injection_log.record_injection(log_space, kind=log_kind, ref=log_ref,
+                                        injected=discovery.injected_case_refs(hits),
+                                        context=log_context)
     return f"{context}\n\n# 실제 요청\n\n{prompt}"
 
 
-def _engine_command(cwd, prompt: str, engine_name: str, model: str) -> list[str]:
+def _engine_command(cwd, prompt: str, engine_name: str, model: str, *, continue_session: bool = False) -> list[str]:
     cli_model = runtime.model_for_cli(engine_name, model)
     if engine_name == "claude":
-        cmd = ["claude", "--dangerously-skip-permissions", "-p", prompt]
+        cmd = ["claude", "--dangerously-skip-permissions"]
+        # 세션 연속성: 이어가기/재개 호출은 같은 cwd의 직전 세션을 --continue로 잇는다.
+        # 종전엔 매 호출이 세션 없는 일회성이라, 타임아웃 이어가기 때 작업 기억이 통째로 리셋돼
+        # 체크포인트 파일만 보고 처음부터 다시 파악해야 했다(직접 시킬 때 대비 다운그레이드의 2순위 원흉).
+        # claude는 대화 세션을 cwd 단위로 저장하므로, 격리된 작업 폴더에서 --continue는 곧
+        # '그 작업 자신의 직전 세션'이다(프로세스가 죽었어도 이어진다).
+        if continue_session:
+            cmd.append("--continue")
+        cmd += ["-p", prompt]
         if cli_model:
             cmd += ["--model", cli_model]
         return cmd
@@ -109,7 +127,50 @@ def _clean_engine_output(engine_name: str, text: str) -> str:
     return text
 
 
-def run_engine(cwd, prompt: str, engine: str = None, model: str = None, timeout: int = 300) -> str:
+# ── 엔진 호출 일시 오류 재시도 (터미널 CLI 에이전트의 API 재시도 방식 차용) ──
+# 레이트리밋(429)·서버 오류(5xx)·네트워크 단절·빈 응답처럼 '다시 부르면 대개 성공하는' 실패를
+# 호출 지점마다 흩어 처리하지 않고 이 레이어에서 분류해 짧은 백오프 후 재호출한다.
+# 타임아웃은 여기서 재시도하지 않는다 — 시간 예산을 이미 소진했으므로, 상위의 진행 기반
+# 이어가기(WORK_TIMEOUT_CONTINUE_LIMIT)·매니저 재시도 루프가 담당한다.
+ENGINE_TRANSIENT_RETRY_LIMIT = 2
+ENGINE_TRANSIENT_RETRY_DELAYS = (4.0, 12.0)
+# 재시도해도 똑같은 결정적 실패(인증·권한·설정) — 이 마커가 보이면 즉시 실패 보고가 맞다.
+_ENGINE_PERMANENT_MARKERS = (
+    "api key", "apikey", "unauthorized", "not logged in", "login required",
+    "invalid_api_key", "permission denied", "forbidden", "인증되지 않", "권한이 없",
+    "no conversation found",  # --continue인데 이 cwd에 세션 없음 — 재시도 무의미(러너가 무-continue로 폴백)
+)
+
+
+def _engine_transient_failure(text: str, returncode: int | None = None) -> bool:
+    """'다시 부르면 대개 성공하는' 실패인지 분류한다.
+    - 빈 응답 + 비정상 종료(rc≠0): 프로세스가 죽으며 완성이 유실된 것 → 재시도 가치 있음.
+      (빈 응답이라도 rc=0 정상 종료면 재시도하지 않는다 — 파일 부수효과만 내고 침묵하는
+       작업 러너의 정상 패턴을 오분류하면 안 된다. rc를 모르면 보수적으로 재시도하지 않는다.)
+    - (stderr)만 남은 출력 + 비정상 종료(rc≠0): API/네트워크 오류가 대부분. 단 인증·권한류
+      결정적 실패 마커가 보이면 재시도하지 않는다. rc=0인 stderr 출력은 기존 계약(stdout 우선·
+      stderr 폴백)대로 그대로 반환한다(재시도 없음 — 회귀 금지).
+    - 타임아웃·취소·정상 출력: 여기 해당 없음.
+    """
+    if returncode is None or returncode == 0:
+        return False
+    value = (text or "").strip()
+    if not value:
+        return True
+    if value.startswith("(엔진 타임아웃)") or value.startswith("(엔진 취소됨"):
+        return False
+    if not value.startswith("(stderr)"):
+        return False
+    low = value.lower()
+    return not any(marker in low for marker in _ENGINE_PERMANENT_MARKERS)
+
+
+def _transient_retry_delay(attempt: int) -> float:
+    idx = min(max(attempt - 1, 0), len(ENGINE_TRANSIENT_RETRY_DELAYS) - 1)
+    return ENGINE_TRANSIENT_RETRY_DELAYS[idx]
+
+
+def _run_engine_once(cwd, prompt: str, engine: str = None, model: str = None, timeout: int = 300) -> tuple[str, int | None]:
     rt = runtime.resolve_runtime(cwd, engine, model)
     cmd = _engine_command(cwd, prompt, rt["engine"], rt["model"])
     try:
@@ -117,11 +178,22 @@ def run_engine(cwd, prompt: str, engine: str = None, model: str = None, timeout:
     except FileNotFoundError:
         raise RuntimeError(f"EngineError: '{cmd[0]}' CLI를 찾을 수 없음 (engine={rt['engine']}, PATH 확인)")
     except subprocess.TimeoutExpired:
-        return "(엔진 타임아웃)"
+        return "(엔진 타임아웃)", None
     out = (r.stdout or "").strip()
     if not out and r.stderr:
         out = "(stderr) " + r.stderr.strip()
-    return _clean_engine_output(rt["engine"], out)
+    return _clean_engine_output(rt["engine"], out), r.returncode
+
+
+def run_engine(cwd, prompt: str, engine: str = None, model: str = None, timeout: int = 300) -> str:
+    out = ""
+    for attempt in range(ENGINE_TRANSIENT_RETRY_LIMIT + 1):
+        out, returncode = _run_engine_once(cwd, prompt, engine, model, timeout)
+        if not _engine_transient_failure(out, returncode):
+            return out
+        if attempt < ENGINE_TRANSIENT_RETRY_LIMIT:
+            time.sleep(_transient_retry_delay(attempt + 1))
+    return out
 
 
 _ORIGINAL_RUN_ENGINE = run_engine
@@ -258,9 +330,14 @@ def run_engine_polling(
     heartbeat_interval: float = 10.0,
     work_policy_loader=None,
     terminate_grace_seconds: float = 5.0,
+    continue_session: bool = False,
 ) -> str:
     rt = runtime.resolve_runtime(cwd, engine, model)
-    cmd = _engine_command(cwd, prompt, rt["engine"], rt["model"])
+    try:
+        cmd = _engine_command(cwd, prompt, rt["engine"], rt["model"], continue_session=continue_session)
+    except TypeError:
+        # 테스트가 _engine_command를 4-인자 fake로 몽키패치하는 기존 계약 호환(세션 연속성 미지원 fake)
+        cmd = _engine_command(cwd, prompt, rt["engine"], rt["model"])
 
     def emit(phase: str, note: str = "") -> None:
         if not heartbeat:
@@ -270,22 +347,7 @@ def run_engine_polling(
         except Exception:
             pass
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-            env=_engine_env(),
-        )
-    except FileNotFoundError:
-        raise RuntimeError(f"EngineError: '{cmd[0]}' CLI를 찾을 수 없음 (engine={rt['engine']}, PATH 확인)")
-
-    stdout_chunks, stderr_chunks, readers = _start_readers(proc)
     started = time.monotonic()
-    last_heartbeat = started
     current_timeout = timeout
     current_heartbeat_interval = heartbeat_interval
     poll_sleep = min(0.25, max(0.05, current_heartbeat_interval / 4.0))
@@ -302,36 +364,85 @@ def run_engine_polling(
         current_heartbeat_interval = policy["heartbeat_interval_sec"]
         poll_sleep = min(0.25, max(0.05, current_heartbeat_interval / 4.0))
 
-    emit("engine_process_started", f"pid={proc.pid}")
+    def _cancelled_reason() -> str | None:
+        if not cancel_check:
+            return None
+        try:
+            if cancel_check():
+                reason = "cancel_requested"
+                if cancel_reason:
+                    try:
+                        reason = str(cancel_reason() or reason)[:120]
+                    except Exception:
+                        reason = "cancel_requested"
+                return reason
+        except Exception as exc:
+            emit("engine_cancel_check_error", f"{type(exc).__name__}: {str(exc)[:240]}")
+        return None
+
+    # 일시 오류(레이트리밋·5xx·빈 응답) 재시도 루프 — 전체 시간 예산(started 기준)은 시도를
+    # 가로질러 공유한다(재시도가 timeout 상한을 늘리지 않음). 취소·타임아웃은 재시도하지 않는다.
+    attempt = 0
     while True:
-        if proc.poll() is not None:
-            _join_readers(readers)
-            return _process_output(stdout_chunks, stderr_chunks, rt["engine"])
-        now = time.monotonic()
-        refresh_work_policy()
-        if current_heartbeat_interval and now - last_heartbeat >= current_heartbeat_interval:
-            emit("engine_poll", f"elapsed={int(now - started)}s")
-            last_heartbeat = now
-        if cancel_check:
-            try:
-                if cancel_check():
-                    reason = "cancel_requested"
-                    if cancel_reason:
-                        try:
-                            reason = str(cancel_reason() or reason)[:120]
-                        except Exception:
-                            reason = "cancel_requested"
-                    _terminate_process(proc, grace_seconds=terminate_grace_seconds)
-                    _join_readers(readers)
-                    emit("engine_cancelled", reason)
-                    return f"(엔진 취소됨: {reason})"
-            except Exception as exc:
-                emit("engine_cancel_check_error", f"{type(exc).__name__}: {str(exc)[:240]}")
-        if current_timeout is not None and now - started >= current_timeout:
-            _terminate_process(proc, grace_seconds=terminate_grace_seconds)
-            _join_readers(readers)
-            return "(엔진 타임아웃)"
-        time.sleep(poll_sleep)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                env=_engine_env(),
+            )
+        except FileNotFoundError:
+            raise RuntimeError(f"EngineError: '{cmd[0]}' CLI를 찾을 수 없음 (engine={rt['engine']}, PATH 확인)")
+
+        stdout_chunks, stderr_chunks, readers = _start_readers(proc)
+        last_heartbeat = time.monotonic()
+        emit("engine_process_started", f"pid={proc.pid}" + (f" retry={attempt}" if attempt else ""))
+        output = None
+        while output is None:
+            if proc.poll() is not None:
+                _join_readers(readers)
+                output = _process_output(stdout_chunks, stderr_chunks, rt["engine"])
+                break
+            now = time.monotonic()
+            refresh_work_policy()
+            if current_heartbeat_interval and now - last_heartbeat >= current_heartbeat_interval:
+                emit("engine_poll", f"elapsed={int(now - started)}s")
+                last_heartbeat = now
+            reason = _cancelled_reason()
+            if reason is not None:
+                _terminate_process(proc, grace_seconds=terminate_grace_seconds)
+                _join_readers(readers)
+                emit("engine_cancelled", reason)
+                return f"(엔진 취소됨: {reason})"
+            if current_timeout is not None and now - started >= current_timeout:
+                _terminate_process(proc, grace_seconds=terminate_grace_seconds)
+                _join_readers(readers)
+                return "(엔진 타임아웃)"
+            time.sleep(poll_sleep)
+
+        if not _engine_transient_failure(output, proc.returncode) or attempt >= ENGINE_TRANSIENT_RETRY_LIMIT:
+            return output
+        attempt += 1
+        delay = _transient_retry_delay(attempt)
+        emit(
+            "engine_transient_retry",
+            f"일시 오류 감지(빈 응답/stderr) — {delay:.0f}s 백오프 후 재호출 {attempt}/{ENGINE_TRANSIENT_RETRY_LIMIT}: "
+            + str(output or "")[:160],
+        )
+        # 백오프 대기 중에도 취소·타임아웃 예산에 반응한다. 예산이 다하면 타임아웃으로 둔갑시키지
+        # 말고 마지막 실제 출력을 반환한다(실패의 원문 보존).
+        wait_until = time.monotonic() + delay
+        while time.monotonic() < wait_until:
+            reason = _cancelled_reason()
+            if reason is not None:
+                emit("engine_cancelled", reason)
+                return f"(엔진 취소됨: {reason})"
+            if current_timeout is not None and time.monotonic() - started >= current_timeout:
+                return output
+            time.sleep(min(0.25, poll_sleep))
 
 
 def _chat_direct_diagnostic(person: str, space: str, text: str, engine: str = None, model: str = None) -> str:
@@ -519,11 +630,15 @@ def work(
     context: dict | None = None,
     requested_by: str = "legacy_engine_work",
     approved_by: str = "task_registry_v0_adapter",
+    task_id: str | None = None,
 ) -> dict:
     seat = PEOPLE / person / "공간" / space
     if not seat.exists():
         raise ValueError(f"입장 안 됨: {person} -> {space}")
-    wcode = gen_code()
+    # task_id 사전 지정: 호출자(_execute_work_plan)가 실행 '전에' plan↔task를 결속(mark_executing)해
+    # 중복 기동을 계획 원장 수준에서 차단할 수 있게 한다(실증 2026-07-02: 15분 넘는 작업이
+    # redispatch에 의해 중복 기동 — plan이 실행 내내 approved+task 없음으로 보였다).
+    wcode = str(task_id or "").strip() or gen_code()
     wdir = seat / "작업" / wcode
     wdir.mkdir(parents=True)
     _work_entry = templates.fill(templates.load("작업_진입점.md"),
@@ -552,14 +667,13 @@ def work(
     )
     task_pack = task_contract["task_pack"]
 
-    def _current_work_policy() -> dict:
-        stored = work_settings.read_folder_settings(wdir)
-        if stored.get("settings_source") == "default_missing_file":
-            return work_settings.normalize_settings(task_pack.get("work_runtime_policy") or {})
-        return work_settings.normalize_settings(stored)
-
+    _current_work_policy = _work_policy_loader(wdir, task_pack)
     work_policy = _current_work_policy()
     (wdir / "발견후보.md").write_text(discovery.render_context(task, discovery_hits), encoding="utf-8")
+    # 주입 로그: 이 작업에 노출된 케이스를 기록(harmful 역추적·음승률 감지의 데이터 기반, P1' 안전판).
+    injection_log.record_injection(space, kind="work", ref=wcode,
+                                   injected=discovery.injected_case_refs(discovery_hits),
+                                   context=context if isinstance(context, dict) else None)
     try:
         rel_wdir = wdir.relative_to(PEOPLE.parent).as_posix()   # 루트기준 작업 폴더 경로(미리보기 보고용)
     except Exception:
@@ -572,7 +686,11 @@ def work(
         "대시보드가 그 경로를 말풍선 미리보기로 자동 렌더한다.\n\n"
         "# TaskPack v0 계약\n\n"
         "- 이 작업은 `task_pack.json`과 `task_handoff_pack.json` 범위 안에서만 수행한다.\n"
-        "- `runtime_capabilities.json`과 `execution_strategy.json`을 확인하고, 가능한 기능만 사용한다.\n"
+        "- **네 엔진의 능력을 전부 발휘해 끝까지 결론을 내라.** `runtime_capabilities.json`에 선언된 능력"
+        "(셸 실행, 웹 리서치/네트워크, 서브에이전트 병렬 탐색, 이미지 판독 등)은 아끼지 말고 적극 사용한다 — "
+        "직접 대화로 시켰을 때와 똑같은 수준으로 일해야 한다. 필요하면 서브에이전트로 조사·검증을 병렬로 돌리고, "
+        "모르는 것은 웹으로 리서치하라. 제한은 능력이 아니라 **범위**다: 산출물 저장·수정은 allowed_paths(이 작업 폴더) "
+        "안에서만, 결과 공개는 release 경로로만, 위험한 일(외부 발송·대량 변경)은 결재로.\n"
         f"- 이 작업의 runner_timeout_sec={work_policy['runner_timeout_sec']}, heartbeat_interval_sec={work_policy['heartbeat_interval_sec']}, "
         f"heartbeat_stale_ms={work_policy['heartbeat_stale_ms']}, progress_report_due_ms={work_policy['progress_report_due_ms']} 정책을 인지한다.\n"
         "- **작업 분할·체크포인트(가장 중요 — 클로드코드/코덱스처럼 일하라):** 아무리 큰 작업도 한 호출에 끝내려 하지 마라. 그게 타임아웃의 1순위 원인이다. 순서는 항상 이렇다:\n"
@@ -597,10 +715,67 @@ def work(
         encoding="utf-8",
     )
     (wdir / "결과.md").write_text("", encoding="utf-8")
+    return _run_task_runner(person, space, wcode, wdir, task_pack, task)
+
+
+def _work_policy_loader(wdir: Path, task_pack: dict):
+    def _load() -> dict:
+        stored = work_settings.read_folder_settings(wdir)
+        if stored.get("settings_source") == "default_missing_file":
+            return work_settings.normalize_settings(task_pack.get("work_runtime_policy") or {})
+        return work_settings.normalize_settings(stored)
+    return _load
+
+
+def resume_work(work_dir) -> dict:
+    """죽은 워커의 작업을 '같은 작업 폴더'에서 체크포인트부터 이어서 재실행한다(교차 프로세스 재개).
+
+    engine.work의 이어가기(WORK_TIMEOUT_CONTINUE_LIMIT)는 러너 프로세스가 살아있을 때만 돈다.
+    러너 자체가 죽으면(하드킬·서버 재시작·기계 슬립) 종전엔 reaper가 error로 박고 '실패 보고'로
+    끝났다 — 체크포인트(결과.md·산출물)가 멀쩡히 남아 있는데도. 이 함수는 그 체크포인트에서
+    같은 작업을 이어가는 재개 진입점이다(run_work --resume가 detached로 호출).
+    결과.md·산출물은 보존되고, 종료 시 동일하게 finalize_task → release로 공개된다.
+    """
+    wdir = Path(work_dir)
+    task_pack = _read_json(wdir / "task_pack.json", {})
+    space = str(task_pack.get("space_id") or "")
+    person = str(task_pack.get("worker_agent") or "")
+    wcode = str(task_pack.get("task_id") or wdir.name)
+    objective = str(task_pack.get("objective") or "")
+    if not space or not person or not wdir.exists():
+        raise ValueError(f"resume_work: task_pack.json에 space/worker 없음 또는 폴더 없음: {wdir}")
+    initial = (
+        "\n\n# 이어서 수행(자동 재개 — 이전 러너 중단)\n"
+        "이전 실행 프로세스가 중단됐다(타임아웃/종료). `결과.md`의 체크포인트와 '## 다음 단계'를 읽고 "
+        "**이미 끝낸 단계는 반복하지 말고 다음 단계부터** 이어서 수행하라. "
+        "이 폴더에 이미 있는 산출물·캡처는 다시 만들지 말고 재활용한다. "
+        "다시 시간이 부족하면 깨끗한 단계 경계에서 멈추고 `결과.md`에 '## 다음 단계'를 갱신하라.\n"
+    )
+    return _run_task_runner(person, space, wcode, wdir, task_pack, objective, initial_continue_prompt=initial)
+
+
+def _run_task_runner(
+    person: str,
+    space: str,
+    wcode: str,
+    wdir: Path,
+    task_pack: dict,
+    task: str,
+    *,
+    initial_continue_prompt: str = "",
+) -> dict:
+    _current_work_policy = _work_policy_loader(wdir, task_pack)
     run_error = None
     run_cancelled = False
     steering_context_events: list[dict] = []
     runtime_seen_steering_seq = int(_read_json(wdir / "work_status.json", {}).get("last_seen_steering_seq") or 0)
+    # 러너 프로세스 pid를 기록한다 — reaper의 자동재개가 '러너가 정말 죽었는지'를 확인해
+    # 살아있는(락대기 등으로 느린) 러너 위에 두 번째 러너를 겹쳐 띄우는 이중 실행을 막는 근거.
+    try:
+        _status = _read_json(wdir / "work_status.json", {})
+        _write_json(wdir / "work_status.json", {**_status, "runner_pid": os.getpid(), "runner_pid_at": now_iso()})
+    except Exception:
+        pass
 
     def _work_cancel_requested(control_state: dict) -> bool:
         nonlocal runtime_seen_steering_seq
@@ -668,7 +843,7 @@ def work(
     revise_restarts = 0
     continue_restarts = 0      # 타임아웃 후 체크포인트에서 이어서 재실행한 횟수
     no_progress_restarts = 0   # 무진행 타임아웃에서 '체크포인트부터' nudge로 재시도한 횟수
-    continue_prompt = ""       # 이어서 재실행 시 주입할 안내
+    continue_prompt = initial_continue_prompt  # 이어서 재실행 시 주입할 안내(재개 진입 시 사전 주입)
     while True:
         engine_attempt += 1
         work_policy = _current_work_policy()
@@ -689,17 +864,32 @@ def work(
                     f"{_latest_steering_summary(steering_context_events)}"
                 )
             engine_prompt = base_engine_prompt + steering_prompt + continue_prompt
+            # 세션 연속성: 2회차 이후(revise/타임아웃 이어가기) 또는 자동재개 진입이면 같은 cwd의
+            # 직전 엔진 세션을 잇는다 — 체크포인트 파일만이 아니라 '작업 기억' 자체가 이어진다.
+            _continue_session = engine_attempt > 1 or bool(initial_continue_prompt)
             if run_engine is _ORIGINAL_RUN_ENGINE:
-                engine_output = run_engine_polling(
-                    wdir,
-                    engine_prompt,
-                    timeout=work_policy["runner_timeout_sec"],
-                    cancel_check=lambda: _work_cancel_requested(control_state),
-                    cancel_reason=lambda: control_state.get("reason") or "cancel_requested",
-                    heartbeat=_work_heartbeat,
-                    heartbeat_interval=work_policy["heartbeat_interval_sec"],
-                    work_policy_loader=_current_work_policy,
-                )
+                def _call_engine(cont: bool) -> str:
+                    return run_engine_polling(
+                        wdir,
+                        engine_prompt,
+                        timeout=work_policy["runner_timeout_sec"],
+                        cancel_check=lambda: _work_cancel_requested(control_state),
+                        cancel_reason=lambda: control_state.get("reason") or "cancel_requested",
+                        heartbeat=_work_heartbeat,
+                        heartbeat_interval=work_policy["heartbeat_interval_sec"],
+                        work_policy_loader=_current_work_policy,
+                        continue_session=cont,
+                    )
+                engine_output = _call_engine(_continue_session)
+                # 세션 부재 폴백: --continue인데 이 cwd에 이어질 세션이 없으면(세션 파일 유실 등)
+                # 즉시 무-continue로 한 번 다시 부른다. 체크포인트 파일 기반 이어가기는 그대로 유효하다.
+                if (
+                    _continue_session
+                    and str(engine_output or "").strip().startswith("(stderr)")
+                    and "no conversation found" in str(engine_output or "").lower()
+                ):
+                    _work_heartbeat("engine_continue_fallback", "직전 세션 없음 — 무-continue로 재호출(체크포인트 기반 이어가기)")
+                    engine_output = _call_engine(False)
             else:
                 engine_output = run_engine(wdir, engine_prompt)
             if _engine_cancel_text(engine_output):

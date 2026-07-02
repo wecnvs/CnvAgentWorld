@@ -1,15 +1,15 @@
 // 부팅과 조립만 한다.
-import { api } from "./api.js?v=20260702-08";
-import { renderPeople, wirePeople } from "./people.js?v=20260702-08";
-import { renderSpaces, wireSpaces } from "./spaces.js?v=20260702-08";
-import { openDir, wireFiles, startFilesAutoRefresh } from "./files.js?v=20260702-08";
-import { wireViewer } from "./viewer.js?v=20260702-08";
-import { wireRoomChat, refreshRoomSpaceSelect } from "./room-chat.js?v=20260702-08";
-import { wireTerminalDock } from "./terminal.js?v=20260702-08";
-import { setupMobileViewport } from "./mobile.js?v=20260702-08";
-import { setupMobileResize } from "./mobile-resize.js?v=20260702-08";
-import { renderCases, wireCases } from "./cases.js?v=20260702-08";
-import { renderApps, wireApps } from "./apps.js?v=20260702-08";
+import { api } from "./api.js?v=20260702-13";
+import { renderPeople, wirePeople } from "./people.js?v=20260702-13";
+import { renderSpaces, wireSpaces } from "./spaces.js?v=20260702-13";
+import { openDir, wireFiles, startFilesAutoRefresh } from "./files.js?v=20260702-13";
+import { wireViewer } from "./viewer.js?v=20260702-13";
+import { wireRoomChat, refreshRoomSpaceSelect } from "./room-chat.js?v=20260702-13";
+import { wireTerminalDock } from "./terminal.js?v=20260702-13";
+import { setupMobileViewport } from "./mobile.js?v=20260702-13";
+import { setupMobileResize } from "./mobile-resize.js?v=20260702-13";
+import { renderCases, wireCases } from "./cases.js?v=20260702-13";
+import { renderApps, wireApps } from "./apps.js?v=20260702-13";
 
 async function refreshAll() {
   await Promise.all([renderPeople(), renderSpaces()]);

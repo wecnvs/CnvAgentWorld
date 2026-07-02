@@ -60,6 +60,7 @@ def _reflow_backstop():
     import threading
     import time
     import core.room_manager as room_manager
+    import core.growth_janitor as growth_janitor
 
     def run():
         while True:
@@ -71,6 +72,9 @@ def _reflow_backstop():
                 room_manager.reap_stale_tasks_all_spaces()
                 # (2) 완료·미게시 결과를 방으로 회수·공개.
                 room_manager.reflow_all_spaces()
+                # (3) 케이스 janitor 전역 스윕(P3') — 저빈도(기본 1시간) 레이트리밋. traction 없는 candidate
+                #     만료 + 완전동일 케이스 dedup. 대표 무개입 수렴의 청소부(설계 §6·§8 자동 안전). 값싼 no-op.
+                growth_janitor.sweep_if_due()
             except Exception:
                 pass
 
@@ -87,6 +91,20 @@ async def _no_store_dashboard(request, call_next):
     response = await call_next(request)
     if request.url.path == "/" or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.middleware("http")
+async def _auth_guard(request, call_next):
+    """옵트인 접근 토큰 가드 — 토큰 파일이 있을 때만 활성, 루프백은 항상 통과 (auth_guard.py)."""
+    import auth_guard
+    ok, set_cookie = auth_guard.check_request(request)
+    if not ok:
+        return JSONResponse(status_code=401, content={"detail": "인증 필요 — ?auth=<토큰>으로 1회 접속"})
+    response = await call_next(request)
+    if set_cookie:
+        response.set_cookie(auth_guard.COOKIE_NAME, auth_guard.load_token(),
+                            max_age=365 * 24 * 3600, httponly=True, samesite="lax")
     return response
 
 

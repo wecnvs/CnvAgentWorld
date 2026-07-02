@@ -1148,10 +1148,12 @@ def review_queue(name_or_dir, *, now: str | None = None) -> list[dict]:
     return out
 
 
-def case_convergence(name_or_dir, *, confirm_threshold: int = DEFAULT_CONFIRM_THRESHOLD) -> list[dict]:
+def case_convergence(name_or_dir, *, confirm_threshold: int = DEFAULT_CONFIRM_THRESHOLD,
+                     include_local: bool = True) -> list[dict]:
     """케이스별 수렴 상태 요약(P5/C2). 이벤트를 한 번만 읽어 worked/harmful 집계 + readiness 플래그.
 
     P1: 이건 *신호*다 — ready_to_promote여도 자동 전이하지 않는다. 실제 active 확정은 promote_case(판단/대표 승인).
+    include_local=False: 대외비 사이드카 케이스를 제외(HTTP 노출용 — condition 텍스트가 새지 않게, CRITICAL-2).
     """
     sdir = _resolve_dir(name_or_dir)
     events = read_events(sdir)
@@ -1168,7 +1170,7 @@ def case_convergence(name_or_dir, *, confirm_threshold: int = DEFAULT_CONFIRM_TH
     except CaseLedgerError:
         cmap = {}
     out = []
-    for case in read_cases(sdir):
+    for case in read_cases(sdir, include_local=include_local):
         status = case.get("status", "")
         if status in DEAD_STATUSES:
             continue

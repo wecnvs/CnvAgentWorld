@@ -107,8 +107,41 @@ def main():
 
     a = sub.add_parser("show"); a.set_defaults(fn=_show)
 
+    a = sub.add_parser("skill-revise-body",
+                       help="스킬 SKILL.md 본문을 안전하게 개정한다(이전본 .history 스냅샷 + CAS + non_overridable 보존 + N케이스 게이트). "
+                            "직접 덮어쓰기 대신 이걸 써라 — 되돌릴 수 있고 안전지침을 못 지운다.")
+    a.add_argument("--skill", required=True, help="스킬 이름(스킬 폴더명)")
+    a.add_argument("--body-file", required=True, help="새 본문(마크다운, frontmatter 제외)이 든 파일 경로")
+    a.add_argument("--by", required=True, help="개정 주체(에이전트 토큰)")
+    a.add_argument("--rationale", required=True, help="무엇을 왜 바꿨는지")
+    a.add_argument("--case-ids", default="", help="본문에 종합한 case_id들(콤마구분) — 2개 이상 필요")
+    a.add_argument("--regression", default="", help="기존 active 케이스를 새 본문에 비춰본 회귀 점검 결과(필수)")
+    a.set_defaults(fn=_skill_revise_body)
+
     args = ap.parse_args()
     args.fn(args)
+
+
+def _skill_revise_body(x):
+    from core import case_ledger, resource_body
+    sdir = case_ledger.skill_dir(x.skill)
+    if not sdir:
+        print(json.dumps({"ok": False, "error": f"스킬 없음: {x.skill}"}, ensure_ascii=False)); sys.exit(1)
+    manifest = sdir / "SKILL.md"
+    try:
+        new_body = Path(x.body_file).read_text(encoding="utf-8")
+    except OSError as e:
+        print(json.dumps({"ok": False, "error": f"본문 파일 읽기 실패: {e}"}, ensure_ascii=False)); sys.exit(1)
+    case_ids = [c.strip() for c in (x.case_ids or "").split(",") if c.strip()]
+    try:
+        cur_ver = resource_body.current_version(manifest)
+        res = resource_body.revise_body(
+            manifest, new_body, expected_version=cur_ver, by=x.by, rationale=x.rationale,
+            from_case_ids=case_ids, regression_attestation=x.regression)
+        print(json.dumps(res, ensure_ascii=False))
+    except resource_body.ResourceBodyError as e:
+        # 게이트 거부 = 정상 안전동작. 본문은 안 바뀐다 — doer는 이 경우 케이스만 반영됐다고 보고한다.
+        print(json.dumps({"ok": False, "gate_rejected": True, "error": str(e)}, ensure_ascii=False)); sys.exit(2)
 
 
 if __name__ == "__main__":

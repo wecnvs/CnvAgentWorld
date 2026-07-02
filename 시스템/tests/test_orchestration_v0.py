@@ -1398,7 +1398,9 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertTrue(caps["supports_network"])
         self.assertTrue(caps["supports_image_inspection"])
 
-        # B) 일반(비-CU) 작업 → 보수 기본 그대로(무회귀)
+        # B) 일반(비-CU) 작업 — 새 계약(2026-07-02 능력 봉인 해제): 능력은 엔진 실제 프로필
+        #    (claude=셸·네트워크·서브에이전트 가능), scope는 리서치 허용 + 외부 발신만 금지,
+        #    CU how-to 블록은 여전히 CU 작업에만 붙는다(오탐 없음).
         n_dir = seat / "작업" / "n01"
         normal = room_manager.task_registry.create_task(
             space, worker=worker, task_id="n01",
@@ -1406,12 +1408,24 @@ class OrchestrationV0Tests(unittest.TestCase):
             work_dir=n_dir, runtime_info=rt,
         )
         npack = normal["task_pack"]
-        self.assertEqual(npack["scope"]["network_policy"], "none")
-        self.assertEqual(npack["scope"]["external_side_effects"], "forbidden")
+        self.assertIn("research_allowed", npack["scope"]["network_policy"])
+        self.assertIn("forbidden", npack["scope"]["external_side_effects"])   # 외부 발신 금지는 유지(결재 몫)
+        self.assertEqual(npack["scope"]["write_paths"], [str(n_dir.relative_to(task_registry.ROOT).as_posix())])  # 쓰기 격리 유지
         self.assertNotIn("computer_use", npack)
         ncaps = json.loads((n_dir / "runtime_capabilities.json").read_text(encoding="utf-8"))
-        self.assertFalse(ncaps["supports_network"])
-        self.assertFalse(ncaps["supports_image_inspection"])
+        self.assertTrue(ncaps["supports_network"])            # claude 엔진 실제 능력 그대로 선언
+        self.assertTrue(ncaps["supports_image_inspection"])
+        self.assertTrue(ncaps["supports_native_subagents"])
+        # 미지 엔진은 보수 폴백(능력을 모르면 부풀리지 않는다)
+        u_dir = seat / "작업" / "u01"
+        unknown = room_manager.task_registry.create_task(
+            space, worker=worker, task_id="u01",
+            objective="미지 엔진 작업", work_dir=u_dir,
+            runtime_info={"engine": "unknown-engine", "model": "x"},
+        )
+        ucaps = json.loads((u_dir / "runtime_capabilities.json").read_text(encoding="utf-8"))
+        self.assertFalse(ucaps["supports_network"])
+        self.assertFalse(ucaps["supports_shell"])
 
     def test_rapid_inputs_not_dropped_obligation_sweep(self):
         # 회귀(라이브): 빠르게 연속으로 온 대표 메시지 2·3이 누락됐다. 매니저가 첫 입력만 처리하고
@@ -1795,9 +1809,28 @@ class OrchestrationV0Tests(unittest.TestCase):
             "cancel_requested": False,
         }
 
-        # (1) heartbeat가 grace(5분)를 넘겨 끊김 + 완료근거 없음 → error 중단보고로 산출 surface
+        # (0) 자동재개 예산이 남아 있으면 error 종결 대신 체크포인트 자동재개를 먼저 디스패치한다
+        #     (클로드코드식 복원 — 실패 보고로 끝내지 않고 잇는다). Popen은 mock으로 실제 기동 차단.
         (work_dir / "상태.json").write_text(json.dumps({"상태": "running"}, ensure_ascii=False), encoding="utf-8")
         stranded = dict(base_item, heartbeat_age_ms=task_registry.TASK_STRAND_REPORT_GRACE_MS + 60_000)
+        with patch.object(task_registry, "snapshot", return_value={"active_items": [stranded]}), \
+             patch.object(task_registry.subprocess, "Popen") as popen_mock:
+            reaped0 = task_registry.reap_stale_tasks(space)
+        self.assertTrue(popen_mock.called)
+        resume_cmd = popen_mock.call_args[0][0]
+        self.assertIn("--resume", resume_cmd)
+        self.assertEqual(reaped0[0].get("reaped_as"), "auto_resumed")
+        marker = json.loads((work_dir / "자동재개.json").read_text(encoding="utf-8"))
+        self.assertEqual(marker["count"], 1)
+        # 상태.json은 error로 바뀌지 않는다(재개가 이어간다)
+        st0 = json.loads((work_dir / "상태.json").read_text(encoding="utf-8"))
+        self.assertEqual(st0["상태"], "running")
+
+        # (1) 자동재개 예산 소진 후에는 종전 계약대로 error 중단보고로 산출 surface
+        (work_dir / "자동재개.json").write_text(json.dumps({
+            "schema": "TaskAutoResume.v1", "count": task_registry.TASK_AUTO_RESUME_LIMIT,
+        }, ensure_ascii=False), encoding="utf-8")
+        (work_dir / "상태.json").write_text(json.dumps({"상태": "running"}, ensure_ascii=False), encoding="utf-8")
         with patch.object(task_registry, "snapshot", return_value={"active_items": [stranded]}):
             reaped = task_registry.reap_stale_tasks(space)
         # 내 분기가 발동: 상태.json이 error(중단 보고)로 재기록되고 finalize가 호출된다.
@@ -1805,6 +1838,8 @@ class OrchestrationV0Tests(unittest.TestCase):
         st_after = json.loads((work_dir / "상태.json").read_text(encoding="utf-8"))
         self.assertEqual(st_after["상태"], "error")
         self.assertIn("스트랜드", st_after.get("사유", ""))
+        self.assertIn("자동재개", st_after.get("사유", ""))       # 재개 이력 고지
+        self.assertIn("체크포인트 보존됨", st_after.get("사유", ""))  # 보존 내용 고지(전부 유실 오해 방지)
         self.assertTrue(reaped)
         self.assertEqual(reaped[0].get("task_id"), "strandtask")
 
@@ -4831,8 +4866,9 @@ class OrchestrationV0Tests(unittest.TestCase):
         self.assertEqual(task_pack["release_policy"]["enqueue_release_queue"], True)
         self.assertEqual(task_pack["release_policy"]["enqueue_when"], ["done"])
         self.assertIn("law.md", "\n".join(task_pack["instruction_files"]))
-        self.assertTrue(any(path.endswith("law.md") for path in task_pack["scope"]["read_paths"]))
-        self.assertTrue(any(path.endswith(f"에이전트/{member}/role.md") for path in task_pack["scope"]["read_paths"]))
+        # 새 scope 계약(2026-07-02): 읽기는 워크스페이스 전체(".") — law.md·role.md도 그 안에 포함된다.
+        self.assertIn(".", task_pack["scope"]["read_paths"])
+        self.assertTrue(any(path.endswith("role.md") for path in task_pack["instruction_files"]))
         self.assertEqual(task_pack["lesson_pack"]["lesson_pack_status"], "ok")
         self.assertEqual(work_status["state"], "done")
         self.assertEqual(work_status["verification"]["status"], "not_run")

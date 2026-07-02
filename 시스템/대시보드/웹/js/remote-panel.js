@@ -1,4 +1,4 @@
-// 원격제어 그리드 — 여러 세션(호스트/VM들)의 라이브 화면을 한 화면에 타일로 띄우고
+// 화면 제어 그리드 — 여러 세션(서버 호스트/원격/VM들)의 라이브 화면을 한 화면에 타일로 띄우고
 // 각각 독립적으로 클릭/타이핑한다. 서로 다른 세션(target)은 백엔드 락이 독립이라 동시 제어 가능.
 //
 // 헛점 방지(단일패널 때와 동일, 타일별로 적용):
@@ -7,7 +7,7 @@
 //  - 좌표: 타일 표시이미지↔naturalW/H(원격 화면크기)↔화면 오프셋 절대변환.
 //  - 정리 누수: 타일/그리드 닫기·페이지 이탈 시 타이머 정리 + 보유 락 전부 해제(beacon).
 //  - 키보드: 포커스된 타일로 라우팅(특수키/단축키 직접, 한글/임의텍스트는 하단 입력창).
-import { api } from "./api.js?v=20260702-08";
+import { api } from "./api.js?v=20260702-13";
 
 const ACTOR_NAME = "대시보드(대표)";
 
@@ -69,7 +69,7 @@ function ensureGrid() {
   root.className = "rpg-overlay" + (STANDALONE ? " standalone" : "");
   root.innerHTML = `
     <div class="rpg-head">
-      <span class="rpg-title">원격 세션 그리드</span>
+      <span class="rpg-title">화면 제어 그리드</span>
       <span class="rpg-meta" data-rpg="meta"></span>
       <span class="rp-spacer"></span>
       <button class="rp-btn" data-rpg="fs" type="button" title="전체화면 ↔ 복귀">⛶ 전체화면</button>
@@ -267,13 +267,35 @@ function startPolling(tile) {
   tile.pollTimer = setTimeout(() => tick(tile), Math.min(1200, Math.max(0, (idx - 1) * 280)));
 }
 
+async function screenshotError(r) {
+  let msg = String(r.status || "오류");
+  try {
+    const ct = r.headers.get("content-type") || "";
+    if (ct.includes("application/json")) {
+      const data = await r.json();
+      msg = data.detail || data.message || msg;
+    } else {
+      msg = (await r.text()) || msg;
+    }
+  } catch (_) {}
+  return String(msg).replace(/\s+/g, " ").slice(0, 220);
+}
+
+function screenFailureMessage(message) {
+  const msg = String(message || "");
+  if (msg.includes("화면 녹화 권한") || msg.includes("Screen Recording")) {
+    return "macOS 화면 녹화 권한 필요 — 시스템 설정에서 권한을 허용한 뒤 대시보드 서버를 재시작하세요.";
+  }
+  return "화면 표시 실패 — " + (msg || "세션 분리/무응답. 재시도 중…");
+}
+
 // blob 더블버퍼: 프레임을 fetch→blob→objectURL로 받아 한 번에 교체 → 재로딩 중 빈 화면(깜빡임) 없음.
 function tick(tile) {
   if (tile.destroyed || tile.loading) return;
   tile.loading = true;
   const url = api.cuScreenshotUrl(tile.target) + "&_=" + Date.now();
   fetch(url)
-    .then((r) => { if (!r.ok) throw new Error(String(r.status)); return r.blob(); })
+    .then(async (r) => { if (!r.ok) throw new Error(await screenshotError(r)); return r.blob(); })
     .then((blob) => {
       if (tile.destroyed) { return; }
       const ou = URL.createObjectURL(blob);
@@ -284,9 +306,9 @@ function tick(tile) {
       // 최대한 빠르게: 보이면 즉시 다음 프레임(체인 속도만큼 — 호스트는 ~5fps). 숨김 탭은 절약.
       scheduleNext(tile, document.hidden ? 2000 : 0);
     })
-    .catch(() => {
+    .catch((err) => {
       if (tile.destroyed) return;
-      tile.loading = false; showMsg(tile, "화면 신호 없음 — 세션 분리/무응답. 재시도 중…");
+      tile.loading = false; showMsg(tile, screenFailureMessage(err && err.message));
       scheduleNext(tile, 2200);
     });
 }

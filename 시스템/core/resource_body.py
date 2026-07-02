@@ -166,3 +166,86 @@ def rollback_body(manifest_path, to_version, *, by: str, rationale: str) -> dict
 def current_version(manifest_path) -> str:
     front, _b, _t = _read_manifest(manifest_path)
     return _front_get(front, "version") or "1"
+
+
+def ensure_snapshot(manifest_path, *, by: str, reason: str) -> dict:
+    """현재 본문을 .history에 스냅샷으로 보존한다(롤백 지점 보장). 이미 최신 스냅샷과 같으면 no-op.
+
+    P1' 안전판: doer가 SKILL.md를 (revise_body를 안 거치고) 직접 편집하더라도, 편집 *직전*에 이걸
+    호출해두면 편집 전 원본이 .history에 남아 되돌릴 수 있다. append-only·멱등(내용 동일 시 skip).
+
+    [주의] 사전 스냅샷은 `pre_{ver}_{ts}.md` **고유 이름**으로 저장한다 — revise_body/rollback_body의
+    `v{ver}.md`와 충돌하면 안 된다. doer가 버전을 안 올리고 편집하면 v{ver}.md가 나중에 편집본으로
+    덮어써져 원본이 사라지기 때문(회귀 테스트가 이 부류를 잡음). 복구는 restore_snapshot로.
+    """
+    from pathlib import Path as _Path
+    manifest_path = _Path(manifest_path)
+    if not manifest_path.exists():
+        return {"ok": False, "reason": "no_manifest"}
+    sdir = manifest_path.parent
+
+    def mutate():
+        cur_text = manifest_path.read_text(encoding="utf-8")
+        hist = sdir / ".history"
+        # 멱등: 동일 내용 스냅샷이 이미 있으면 새로 만들지 않는다(이름 규칙 무관).
+        if hist.is_dir():
+            for snap in hist.glob("*.md"):
+                try:
+                    if snap.read_text(encoding="utf-8") == cur_text:
+                        return {"ok": True, "skipped": "unchanged"}
+                except OSError:
+                    continue
+        try:
+            front, _b, _t = _read_manifest(manifest_path)
+            cur_ver = _front_get(front, "version") or "1"
+        except ResourceBodyError:
+            cur_ver = "0"
+        hist.mkdir(parents=True, exist_ok=True)
+        ts = now_iso().replace(":", "").replace("-", "")
+        target = hist / f"pre_{cur_ver}_{ts}.md"
+        n = 1
+        while target.exists():
+            target = hist / f"pre_{cur_ver}_{ts}_{n}.md"
+            n += 1
+        target.write_text(cur_text, encoding="utf-8")
+        case_ledger._append_jsonl(hist / "revisions.jsonl", {
+            "schema": "BodyRevision.v1", "presnapshot": True,
+            "version": cur_ver, "by": by, "rationale": reason,
+            "snapshot": _rel(target), "at_utc": now_iso(),
+        })
+        return {"ok": True, "snapshot": _rel(target), "version": cur_ver}
+
+    return case_ledger.with_resource_lock(sdir, mutate)
+
+
+def restore_snapshot(manifest_path, snapshot_name: str, *, by: str, rationale: str) -> dict:
+    """임의의 .history 스냅샷 파일(이름)로 본문을 되돌린다(버전은 앞으로 증가 — CAS 단조 유지).
+
+    rollback_body는 v{정수}.md만 받지만, 이건 pre_*.md 같은 사전 스냅샷 복구용이다.
+    """
+    from pathlib import Path as _Path
+    manifest_path = _Path(manifest_path)
+    sdir = manifest_path.parent
+
+    def mutate():
+        snap = sdir / ".history" / _Path(snapshot_name).name
+        if not snap.exists():
+            raise ResourceBodyError(f"스냅샷 없음: {snapshot_name}")
+        front, _old, cur_text = _read_manifest(manifest_path)
+        cur_ver = _front_get(front, "version") or "1"
+        hist = sdir / ".history"
+        # 현재본을 잃지 않게 별도 이름으로 보존(v{ver}.md 충돌 회피).
+        ts = now_iso().replace(":", "").replace("-", "")
+        (hist / f"pre_{cur_ver}_{ts}_restore.md").write_text(cur_text, encoding="utf-8")
+        sfront, sbody, _ = _read_manifest(snap)
+        new_ver = _next_version(cur_ver)
+        nf = _front_set(sfront, "version", new_ver)
+        nf = _front_set(nf, "last_updated", now_iso())
+        manifest_path.write_text(_render(nf, sbody), encoding="utf-8")
+        case_ledger._append_jsonl(hist / "revisions.jsonl", {
+            "schema": "BodyRevision.v1", "rollback": True, "restored_from_snapshot": _Path(snapshot_name).name,
+            "from_version": cur_ver, "to_version": new_ver, "by": by, "rationale": rationale, "at_utc": now_iso(),
+        })
+        return {"ok": True, "version": new_ver, "restored_from_snapshot": _Path(snapshot_name).name}
+
+    return case_ledger.with_resource_lock(sdir, mutate)

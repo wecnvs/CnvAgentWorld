@@ -3,7 +3,7 @@
 // - standalone/external : 실행 → 서버 호스트에서 실행. 실행 중 상태 + 중지 버튼.
 // - revit-addin/install-only : 설치파일 다운로드만.
 // 다운로드는 기존 파일 API(/api/files/raw?download=1)를 그대로 쓴다.
-import { api } from "./api.js?v=20260702-08";
+import { api } from "./api.js?v=20260702-13";
 
 // 원격제어는 '별도 창'으로 연다(대표가 채팅하면서 동시에 원격제어 가능하게). remote.html이 그리드를 그린다.
 // 같은 창 이름을 쓰므로 같은 세션 버튼을 또 눌러도 새 창이 아니라 기존 창이 떠오른다.
@@ -69,9 +69,10 @@ function actionsFor(app) {
       out.push(`<button class="app-act run" type="button" data-action="run" data-dir="${dir}" data-web="0" data-label="${esc(app.name)}" title="${esc(app.run)}">▶ 실행</button>`);
     }
   }
-  // 원격 세션(cu-helper)이면: 그 세션 화면을 브라우저에서 보고 클릭/타이핑하는 패널을 연다.
-  if (app.target_channel === "cu-helper" && !app.download_only) {
-    out.push(`<button class="app-act remote" type="button" data-action="remote" data-target="${esc(app.target)}" data-label="${esc(app.name)}" title="이 세션 화면을 브라우저에서 라이브로 보고 클릭/타이핑">🖥 원격제어</button>`);
+  // 화면 제어: 원격/VM 앱은 항상, 로컬 외부앱은 실행 중일 때 서버 전체 화면을 연다.
+  if (!app.download_only && (app.target_channel === "cu-helper" || (app.target_channel === "local" && app.running && !app.web))) {
+    const isLocal = app.target_channel === "local";
+    out.push(`<button class="app-act remote" type="button" data-action="remote" data-target="${esc(app.target)}" data-label="${esc(app.name)}" title="${isLocal ? "서버 컴퓨터의 현재 전체 데스크톱을 엽니다" : "이 원격/VM 세션 화면을 브라우저에서 라이브로 보고 클릭/타이핑"}">${isLocal ? "🖥 서버 화면" : "🖥 원격제어"}</button>`);
   }
   if (app.install_path) {
     out.push(`<a class="app-act install" href="${dlUrl(app.install_path)}" title="${esc(app.install_path.split("/").pop())}">⤓ 설치파일</a>`);
@@ -133,33 +134,37 @@ function appCard(app) {
     </article>`;
 }
 
-// 원격 세션(원격 컴퓨터·VM) — 앱과 별개로 cu-helper 타깃을 직접 화면제어하는 카드.
+// 화면 제어 세션(서버 전체 화면·원격 컴퓨터·VM) — 앱과 별개로 타깃을 직접 제어하는 카드.
 //  서로 독립된 세션이라 동시에 띄워 각각 조작할 수 있다(도윤 호스트 / VM-A / VM-B …).
 function sessionCard(t) {
   const label = esc(t.label || t.name);
   const isLocal = t.channel === "local";
   const badge = isLocal
-    ? `<span class="app-target ch-local">🖥️ 서버 컴퓨터</span>`
-    : `<span class="app-target ch-cu-helper">🪟 원격 세션</span>`;
+    ? `<span class="app-target ch-local">🖥️ 서버 전체 화면</span>`
+    : `<span class="app-target ch-cu-helper">🪟 원격/VM 세션</span>`;
+  const buttonLabel = isLocal ? "🖥 서버 전체 화면" : "🖥 세션 화면";
+  const title = isLocal
+    ? "서버 컴퓨터의 현재 전체 데스크톱을 브라우저에서 보고 클릭/타이핑"
+    : "이 원격/VM 세션 화면을 브라우저에서 보고 클릭/타이핑";
   return `<article class="app-card sess-card">
       <div class="app-card-head">
         <span class="app-name">${label}</span>
         <span class="app-badges">${badge}</span>
       </div>
       <div class="app-actions">
-        <button class="app-act remote" type="button" data-action="remote" data-target="${esc(t.name)}" data-label="${label}" title="이 ${isLocal ? "서버 컴퓨터" : "세션"} 화면을 브라우저에서 보고 클릭/타이핑">🖥 원격제어</button>
+        <button class="app-act remote" type="button" data-action="remote" data-target="${esc(t.name)}" data-label="${label}" title="${esc(title)}">${buttonLabel}</button>
       </div>
     </article>`;
 }
 function sessionSection(targets) {
-  // 서버 컴퓨터(local) + 원격 윈도우/VM(cu-helper)을 원격제어 카드로. 모두 서로 독립·동시 제어 가능.
+  // 서버 컴퓨터(local) + 원격 윈도우/VM(cu-helper)을 화면 제어 카드로. 모두 서로 독립·동시 제어 가능.
   // desktop-frvh9d8은 도윤컴-호스트와 동일 호스트라 중복 제외(레빗 앱 카드가 별도로 그걸 가리킴).
   const sess = (targets || []).filter(
     (t) => (t.channel === "cu-helper" || t.channel === "local") && t.name !== "desktop-frvh9d8");
   if (!sess.length) return "";
   // 서버 컴퓨터(local)를 맨 앞에 — 중앙 컨트롤센터의 '이 서버'가 먼저 보이게.
   sess.sort((a, b) => (a.channel === "local" ? -1 : 0) - (b.channel === "local" ? -1 : 0));
-  return `<div class="apps-subhead"><span>원격 세션 — 서버 컴퓨터·원격·VM (서로 독립·동시 제어)</span>
+  return `<div class="apps-subhead"><span>화면 제어 세션 — 서버 전체 화면·원격 Windows·VM</span>
       <button class="rp-btn sess-openall" type="button" data-action="remote-all" title="모든 세션을 한 화면 그리드로">▦ 전체 그리드로 열기</button></div>
     <div class="sess-grid">${sess.map(sessionCard).join("")}</div>`;
 }

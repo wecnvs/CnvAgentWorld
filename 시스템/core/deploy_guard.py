@@ -29,10 +29,20 @@ PATTERNS = [
     ("인명+직함", re.compile(r"[가-힣]{1,4}\s?(?:부장|과장|차장|대리|팀장|사장|대표님|이사|상무|전무|회장|부사장|실장|본부장|주임)")),
 ]
 
+# 고신뢰(오탐 거의 없는) 자격증명·식별 패턴 — 손수 작성 자원(도구/자산/앱)에도 적용해도 안전한 것만.
+# 금액·인명+직함처럼 느슨한 패턴은 스크립트·문서에서 오탐이 잦아 자동기입 벡터(케이스)에만 쓴다.
+_HIGH_CONFIDENCE_LABELS = {"email", "주민번호", "사업자번호", "카드번호", "휴대전화"}
+HIGH_CONFIDENCE_PATTERNS = [(l, rx) for l, rx in PATTERNS if l in _HIGH_CONFIDENCE_LABELS]
+
 # 배포되는 등급(= .gitignore 화이트리스트). 나머지 등급/사이드카는 배포 안 됨 → 스캔 불필요.
 DEPLOYED_GRADE = "기본"
+# 자동 기입 벡터(자기성장 루프가 씀) — 전체 패턴 스캔.
 DEPLOYED_FILES = ("SKILL.md", "지식.md", "cases.jsonl")
 RESOURCE_ROOTS = ("스킬", "지식")
+# 손수 작성 배포 자원(도구/자산/앱 기본) — 텍스트 파일을 고신뢰 패턴으로만 스캔(오탐 억제).
+HANDMADE_ROOTS = ("도구", "자산", "앱")
+_TEXT_EXTS = {".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".py", ".sh", ".ps1", ".js",
+              ".csv", ".tsv", ".ini", ".cfg", ".toml", ".env", ".command"}
 
 
 def _mask(text: str) -> str:
@@ -42,18 +52,23 @@ def _mask(text: str) -> str:
     return text[:2] + "***" + text[-1]
 
 
-def scan_text(text: str) -> list[dict]:
+def scan_text(text: str, patterns=PATTERNS) -> list[dict]:
     """텍스트에서 식별정보 형식을 찾는다. 매치는 마스킹해 반환(스캔 결과 자체가 유출되지 않게)."""
     hits = []
-    for label, rx in PATTERNS:
+    for label, rx in patterns:
         for m in rx.finditer(text or ""):
             hits.append({"label": label, "match": _mask(m.group(0))})
     return hits
 
 
 def scan_deployable() -> list[dict]:
-    """배포되는 '기본' 등급 자원의 본문/공개 케이스를 스캔. 발견 목록(파일별) 반환."""
+    """배포되는 '기본' 등급 자원을 스캔. 발견 목록(파일별) 반환.
+
+    - 스킬/지식 케이스(자동 기입 벡터): 전체 패턴.
+    - 도구/자산/앱 기본(손수 작성): 텍스트 파일을 고신뢰 패턴으로만(오탐 억제).
+    """
     findings = []
+    # (1) 자동 기입 벡터 — 전체 패턴
     for root in RESOURCE_ROOTS:
         base = ROOT / root / DEPLOYED_GRADE
         if not base.is_dir():
@@ -65,7 +80,22 @@ def scan_deployable() -> list[dict]:
                 text = path.read_text(encoding="utf-8")
             except Exception:
                 continue
-            hits = scan_text(text)
+            hits = scan_text(text, PATTERNS)
+            if hits:
+                findings.append({"path": str(path.relative_to(ROOT)), "hits": hits})
+    # (2) 손수 작성 배포 자원 — 고신뢰 패턴만
+    for root in HANDMADE_ROOTS:
+        base = ROOT / root / DEPLOYED_GRADE
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in _TEXT_EXTS:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            hits = scan_text(text, HIGH_CONFIDENCE_PATTERNS)
             if hits:
                 findings.append({"path": str(path.relative_to(ROOT)), "hits": hits})
     return findings

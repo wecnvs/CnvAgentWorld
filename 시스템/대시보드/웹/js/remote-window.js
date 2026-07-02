@@ -1,6 +1,6 @@
-// remote.html 진입 — 별도 창에서 원격 세션 그리드를 그린다.
+// remote.html 진입 — 별도 창에서 화면 제어 그리드를 그린다.
 // URL ?targets=A,B,C (타깃 별칭, comma) → 각 세션 타일을 띄운다. 라벨은 /api/apps의 targets에서 조회.
-import { openRemotePanel, setStandalone } from "./remote-panel.js?v=20260702-08";
+import { openRemotePanel, setStandalone } from "./remote-panel.js?v=20260702-13";
 
 setStandalone(true);
 
@@ -22,6 +22,6 @@ setStandalone(true);
   if (empty && empty.parentNode) empty.parentNode.removeChild(empty);
   names.forEach((n) => openRemotePanel(n, labels[n] || n));
   document.title = names.length > 1
-    ? `원격 ${names.length}개 세션 — CnvAgentWorld`
-    : `원격: ${labels[names[0]] || names[0]}`;
+    ? `화면 ${names.length}개 세션 — CnvAgentWorld`
+    : `화면: ${labels[names[0]] || names[0]}`;
 })();

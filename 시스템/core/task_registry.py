@@ -5,14 +5,17 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 from . import lesson_ledger, orchestration, release_queue, work_settings
-from .paths import ROOT, SPACES
+from .paths import ROOT, SPACES, SYS
 from .transcript import now_iso, read
 
 
@@ -33,6 +36,11 @@ TASK_STARTUP_GRACE_MS = 90_000
 # 조용히 active에 박제하지 않고 error(중단 보고)로 강제 종결해 그때까지의 산출을 방에 surface한다
 # (대표 신고: 작업이 돼도 결과·캡처가 대화로 안 돌아온다 → 결과가 반드시 돌아오게).
 TASK_STRAND_REPORT_GRACE_MS = 5 * 60_000
+# 무진행 스트랜드를 error로 종결하기 전에, 같은 작업 폴더의 체크포인트에서 '이어서' 자동 재실행해 보는
+# 횟수 상한(교차 프로세스 재개 — run_work --resume). 러너 프로세스 자체가 죽으면(하드킬·서버 재시작·슬립)
+# engine.work의 프로세스 내 이어가기(WORK_TIMEOUT_CONTINUE_LIMIT)가 못 돌므로 여기서 잇는다.
+# 폭주 방지: 마커(자동재개.json) 선기록 멱등 + 유한 상한 + blocked(구조적 막힘)·취소요청은 재개하지 않음.
+TASK_AUTO_RESUME_LIMIT = 2
 TASK_PROGRESS_REPORT_DUE_REASON_CODE = "progress_report_due"
 TASK_RUNTIME_HEARTBEAT_LABELS = {
     "steering_progress_seen": ("progress_seen", "진행보고 요청 확인"),
@@ -584,6 +592,8 @@ def _compact_task(row: dict, *, now: datetime | None = None) -> dict:
         "worker_agent": row.get("worker_agent", ""),
         "state": row.get("state", ""),
         "work_dir": row.get("work_dir", ""),
+        "task_kind": row.get("task_kind", "user_work"),
+        "objective_preview": str(row.get("objective_preview", ""))[:140],
         "cancel_requested": bool(row.get("cancel_requested")),
         "cancellation_request_id": row.get("cancellation_request_id", ""),
         "cancellation_reason": str(row.get("cancellation_reason", ""))[:240],
@@ -628,10 +638,19 @@ def prioritized_active_items(items: list[dict]) -> list[dict]:
 
 def _latest_tasks(rows: list[dict]) -> dict:
     latest_by_task = {}
+    # task_kind·objective_preview는 task_created 행에만 있고 이후 heartbeat 행엔 없다 — 앞선 행에서
+    # 본 값을 뒤 행으로 이어 붙여, 최신행 기준 스냅샷에도 종류·목표가 살아있게 한다(사회자 구분용).
+    carry: dict[str, dict] = {}
     for idx, row in enumerate(rows):
         task_id = row.get("task_id")
-        if task_id:
-            latest_by_task[task_id] = {**row, "_row_index": idx}
+        if not task_id:
+            continue
+        c = carry.setdefault(task_id, {})
+        if row.get("task_kind"):
+            c["task_kind"] = row.get("task_kind")
+        if row.get("objective_preview"):
+            c["objective_preview"] = row.get("objective_preview")
+        latest_by_task[task_id] = {**c, **row, "_row_index": idx}
     return latest_by_task
 
 
@@ -716,11 +735,53 @@ def _discovery_manifest(hits: list[tuple[int, dict]] | None) -> dict:
     }
 
 
+# 엔진별 '실제' 능력 프로필 — 에이전트가 이 선언을 정직하게 지키므로, 실제보다 보수로 선언하면
+# 에이전트가 자기 능력을 스스로 봉인한다(실증 2026-07-02 레빗 240a/329e: supports_network=false
+# 선언만 보고 정직하게 BLOCKED — 실제 claude/agy는 skip-permissions로 셸·네트워크 전부 가능했음).
+# 이 다운그레이드가 '방에 시키면 직접 시킬 때보다 못하다'의 1순위 원흉이었다. 실행 커맨드
+# (_engine_command: claude/agy --dangerously-skip-permissions, codex --dangerously-bypass...)가
+# 실제로 부여하는 능력을 그대로 선언한다. 범위 통제는 능력 봉인이 아니라 allowed_paths·release 게이트
+# ·결재(위험신호)로 한다.
+_ENGINE_CAPABILITY_PROFILES = {
+    "claude": {
+        "supports_shell": True,
+        "supports_network": True,           # WebSearch/WebFetch + 셸 curl
+        "supports_native_subagents": True,  # Task 도구(서브에이전트·병렬 탐색)
+        "supports_parallel_tool_calls": True,
+        "supports_image_inspection": True,  # Read로 이미지/스크린샷 판독
+        "supports_mcp_resources": True,     # 구성된 MCP 서버가 있으면 사용 가능
+    },
+    "gemini": {
+        "supports_shell": True,
+        "supports_network": True,
+        "supports_native_subagents": False,
+        "supports_parallel_tool_calls": True,
+        "supports_image_inspection": True,
+        "supports_mcp_resources": False,
+    },
+    "codex": {
+        "supports_shell": True,
+        "supports_network": True,
+        "supports_native_subagents": False,
+        "supports_parallel_tool_calls": True,
+        "supports_image_inspection": True,
+        "supports_mcp_resources": False,
+    },
+}
+_CONSERVATIVE_CAPABILITY_PROFILE = {
+    "supports_shell": False,
+    "supports_network": False,
+    "supports_native_subagents": False,
+    "supports_parallel_tool_calls": False,
+    "supports_image_inspection": False,
+    "supports_mcp_resources": False,
+}
+
+
 def runtime_capabilities(runtime_info: dict, work_policy: dict | None = None) -> dict:
     engine = runtime_info.get("engine", "")
     model = runtime_info.get("model", "")
-    supports_shell = engine == "codex"
-    supports_parallel = engine == "codex"
+    profile = _ENGINE_CAPABILITY_PROFILES.get(engine, _CONSERVATIVE_CAPABILITY_PROFILE)
     policy = work_settings.normalize_settings(work_policy or {})
     return {
         "schema": "RuntimeCapabilityManifest.v1",
@@ -731,19 +792,14 @@ def runtime_capabilities(runtime_info: dict, work_policy: dict | None = None) ->
         "heartbeat_stale_ms": policy["heartbeat_stale_ms"],
         "progress_report_due_ms": policy["progress_report_due_ms"],
         "supports_file_edit": True,
-        "supports_shell": supports_shell,
-        "supports_network": False,
         "supports_planning": True,
-        "supports_native_subagents": False,
-        "supports_parallel_tool_calls": supports_parallel,
-        "supports_mcp_resources": False,
-        "supports_image_inspection": False,
+        **profile,
         "max_context_tokens_class": "unknown",
         "known_limitations": [
             "native CnvAgentWorld child task creation is reserved for TaskRegistry/space manager",
-            "network capability is conservative false unless a later runtime probe enables it",
+            "산출물 저장·수정은 allowed_paths(작업 폴더) 안에서만 — 능력이 아니라 범위의 제한",
         ],
-        "source": "runtime.resolve_runtime+conservative_v0",
+        "source": "engine_capability_profile_v1",
         "detected_at": now_iso(),
         "validated_by": "task_registry_v0_adapter",
     }
@@ -916,19 +972,20 @@ def create_task(
     # 컴퓨터유즈 작업이면 scope를 '인가'로 상향(이 작업 한정). 아니면 보수 기본 그대로(무회귀).
     cu_target = detect_computer_use_target(objective)
     cu_channel = ""
+    # scope는 '범위'를 통제한다 — 능력 봉인이 아니다. 종전 보수 기본(read=작업폴더뿐·network none·
+    # tools [])은 정직한 에이전트가 발견된 스킬/지식/도구조차 '내 scope 밖'이라 못 읽고, 리서치도 못 해
+    # 직접 시킬 때보다 다운그레이드되는 원흉이었다(감사 2026-07-02; 실증 레빗 240a/329e·폴리텍 6ff9).
+    # 새 기본: 읽기=워크스페이스 전체(자원을 실제로 써먹게), 쓰기=작업폴더만(격리 유지), 도구 실행 허용,
+    # 네트워크=조회·리서치·다운로드 허용. 단 '외부로 내보내는 부작용'(발송·발행·게시)은 여전히 금지 —
+    # 그건 결재 게이트(needs_approval)의 몫이다.
     _base_scope = {
-        "read_paths": [
-            _rel(work_dir),
-            _rel((work_dir / role_path).resolve()),
-            _rel((work_dir / law_path).resolve()),
-            _rel((work_dir / law_work_path).resolve()),
-        ],
+        "read_paths": ["."],
         "write_paths": [_rel(work_dir)],
-        "execute_paths": [],
+        "execute_paths": ["도구/"],
         "forbidden_paths": ["공간/*/대화.jsonl", "에이전트/*/공간/*/대화.jsonl"],
-        "allowed_tools": [],
-        "network_policy": "none",
-        "external_side_effects": "forbidden",
+        "allowed_tools": ["engine_native_all"],
+        "network_policy": "research_allowed(조회·리서치·다운로드 가능; 외부 발신은 external_side_effects 규칙)",
+        "external_side_effects": "forbidden(외부 발송·발행·게시는 결재 없이 금지)",
     }
     if cu_target:
         try:
@@ -939,11 +996,16 @@ def create_task(
         _scope = _computer_use_scope(_base_scope, cu_target, cu_channel)
     else:
         _scope = _base_scope
+    # task_kind: 'user_work'(대표가 요청한 산출물, 기본) vs 'skill_authoring'(성장 루프가 자동 생성한
+    # 스킬 본문 개선) 등. 사회자가 '성장 작업'을 '대표 요청 작업'으로 오인해 stop하지 않게 구분한다
+    # (실증 2026-07-02: propose_case가 띄운 스킬저작 작업을 다운로드 작업으로 착각). context로 흘려받는다.
+    task_kind = str((context or {}).get("task_kind") or "user_work")
     pack = {
         "schema": "TaskPack.compat_minimal.v1",
         "task_pack_id": task_pack_id,
         "created_at": now_iso(),
         **identity,
+        "task_kind": task_kind,
         "requested_by": requested_by,
         "approved_by": approved_by,
         "objective": objective,
@@ -994,7 +1056,10 @@ def create_task(
             "policy": "cooperative_first",
         },
         "lesson_pack": lesson_pack,
-        "discovery_manifest": discovery_manifest,
+        # 발견 후보는 발견후보.md 한 곳에만 둔다 — 종전엔 같은 내용이 3중 인코딩(발견후보.md 12KB +
+        # discovery_manifest.json 6KB + 이 pack 임베드)돼 매 wake·이어가기마다 스캐폴드를 불렸다
+        # (읽는 코드는 어디에도 없었음 — 감사 2026-07-02). 구조 데이터가 필요해지면 그때 단일 출처로 복원.
+        "discovery_manifest": {"schema": discovery_manifest.get("schema", ""), "considered_count": len(discovery_manifest.get("considered") or []), "rendered_at": "발견후보.md"},
     }
     if cu_target:
         # 에이전트가 '어떻게' 화면을 보고 조작하는지(로컬호스트 /api/cu·charter·락)를 명시한다.
@@ -1044,14 +1109,13 @@ def create_task(
         "last_seen_steering_seq": 0,
         **work_policy_fields,
         "verification": {"status": "not_run", "not_run_reason": "작업 실행 전"},
-        "discovery_manifest_path": "discovery_manifest.json",
+        "discovery_manifest_path": "발견후보.md",
         **_context_fields(context),
     }
     _write_json(work_dir / "task_pack.json", pack)
     _write_json(work_dir / "task_handoff_pack.json", handoff)
     _write_json(work_dir / "runtime_capabilities.json", capabilities)
     _write_json(work_dir / "execution_strategy.json", strategy)
-    _write_json(work_dir / "discovery_manifest.json", discovery_manifest)
     _write_json(work_dir / work_settings.SETTINGS_FILENAME, work_policy)
     _write_json(work_dir / "work_status.json", status)
     _write_json(work_dir / "상태.json", {"상태": "running", "시작": status["started_at"], "task_pack_id": task_pack_id})
@@ -1067,6 +1131,8 @@ def create_task(
         "task_pack_checksum": pack["task_pack_checksum"],
         "worker_agent": worker,
         "work_dir": _rel(work_dir),
+        "task_kind": task_kind,
+        "objective_preview": str(objective or "")[:140],
         "last_heartbeat_at": status["last_heartbeat_at"],
         "heartbeat_phase": status["heartbeat_phase"],
         "heartbeat_count": status["heartbeat_count"],
@@ -1882,6 +1948,25 @@ def finalize_task(space: str, *, task_id: str, worker: str, work_dir: Path, task
         latest = {}
     result = (work_dir / "결과.md").read_text(encoding="utf-8") if (work_dir / "결과.md").exists() else ""
     state = str(raw_status.get("상태") or raw_status.get("state") or "partial")
+    # [투명 좀비 방지] finalize는 '러너가 끝난 뒤'에만 불린다 — 이 시점의 비종결/비계약 상태
+    # (in_progress·진행중·partial·워커 임의 문구)는 '실행이 끝났는데 완주 못 함'이다. 그대로 registry에
+    # 박으면 active(running)도 closed도 아닌 상태가 돼 reaper·release·사회자 어디에도 안 보이는 투명
+    # 좀비가 된다(실증 2026-07-02 폴리텍 6ff9: 상태.json=in_progress → registry in_progress → 25분 방치,
+    # 결과도 방으로 안 돌아옴). error(중단 보고)로 정규화해 종결·surface한다 — error는 release로 자동
+    # 공개돼 부분 산출이 조용히 사라지지 않고(reaper 스트랜드 처리와 동일 의미론), 미완을 done으로
+    # 오승격하지도 않는다.
+    if state not in {"done", "error", "blocked", "cancelled", "partial_ready"}:
+        original_state = state
+        state = "error"
+        raw_status = {
+            **raw_status,
+            "상태": "error",
+            "사유": (str(raw_status.get("사유") or raw_status.get("reason") or "").strip()
+                     + (" | " if raw_status.get("사유") or raw_status.get("reason") else "")
+                     + f"finalize: 실행이 끝났으나 비종결 상태({original_state or '없음'})로 남음 — 중단 보고로 정규화"
+                     + (f", 체크포인트 보존됨(결과.md {len(result.strip())}자)" if result.strip() else "")),
+        }
+        _write_json(work_dir / "상태.json", raw_status)
     # C(타임아웃이 완료를 가리는 문제): 엔진이 '최종 보고 턴'에서 타임아웃나면 상태.json을 error로 덮어써,
     # 작업이 체크포인트(결과.md)상 완료(예: 4/4 DONE)인데도 방엔 '⚠️ 타임아웃 에러'로만 떠 사회자·대표가
     # 실패로 오인하고 정체된다(실증 2026-06-29 c6b6 seq45). 보고 턴 타임아웃은 작업 실패가 아니므로,
@@ -2311,6 +2396,77 @@ def recent_closed_items(space: str, *, worker: str = "", limit: int = 20) -> lis
     return rows[::-1][:limit]  # 최신 종료 먼저
 
 
+def _try_auto_resume(space: str, *, task_id: str, worker: str, work_dir: Path, state: str) -> bool:
+    """무진행 스트랜드를 error 종결 대신 체크포인트에서 자동 재개해 본다. 성공적으로 디스패치하면 True.
+
+    안전장치(폭주 금지 — 목표.md 요구 8):
+      · blocked(구조적 막힘 — 권한/환경/자격증명)·취소요청 작업은 재개하지 않는다(기계적 재시도 금지).
+      · `자동재개.json` 마커를 '디스패치 전에' 기록해 멱등을 보장하고, 상한(TASK_AUTO_RESUME_LIMIT) 초과 시 중단.
+      · 디스패치 직후 heartbeat를 갱신해 다음 reap 주기가 같은 작업을 또 집지 않게 한다.
+    """
+    # 워커가 종결 상태(done/error/blocked/cancelled)를 스스로 남겼으면 재개하지 않는다 —
+    # 재개 대상은 '아무 종결도 못 쓰고 러너가 죽은' 미드플라이트 스트랜드뿐이다(결정적 실패 기계 재시도 금지).
+    if state not in {"", "running", "in_progress", "진행중"}:
+        return False
+    if (work_dir / "취소요청.json").exists():
+        return False
+    if not (work_dir / "task_pack.json").exists():
+        return False
+    # 러너가 아직 살아있으면(락대기 등으로 heartbeat만 늦는 경우) 겹쳐 띄우지 않는다 — 이중 실행 방지.
+    try:
+        runner_pid = int(_read_json(work_dir / "work_status.json", {}).get("runner_pid") or 0)
+        if runner_pid > 0:
+            os.kill(runner_pid, 0)  # 예외 없음 = 살아있음
+            return False
+    except (ProcessLookupError, ValueError):
+        pass  # 죽었거나 pid 없음 → 재개 가능
+    except PermissionError:
+        return False  # 존재하지만 권한 밖(살아있음으로 간주)
+    except Exception:
+        pass
+    marker_path = work_dir / "자동재개.json"
+    marker = _read_json(marker_path, {})
+    count = int(marker.get("count") or 0)
+    if count >= TASK_AUTO_RESUME_LIMIT:
+        return False
+    _write_json(marker_path, {
+        "schema": "TaskAutoResume.v1",
+        "count": count + 1,
+        "limit": TASK_AUTO_RESUME_LIMIT,
+        "last_at": now_iso(),
+        "reason": "reaper: heartbeat 장기 끊김 — error 종결 대신 체크포인트 자동재개",
+    })
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SYS) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "core.run_work", "--resume", str(work_dir)],
+            cwd=str(SYS), start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
+    except Exception:
+        return False  # Popen 실패 → 종전 error 종결 경로로 폴백(마커는 남아 다음 시도로 계산됨)
+    try:
+        task_pack = _read_json(work_dir / "task_pack.json", {})
+        record_heartbeat(
+            space, task_id=task_id, worker=worker, work_dir=work_dir, task_pack=task_pack,
+            phase="auto_resume_dispatched",
+            note=f"자동재개 {count + 1}/{TASK_AUTO_RESUME_LIMIT} — 체크포인트에서 이어서 재실행",
+        )
+    except Exception:
+        pass
+    return True
+
+
+def task_exists(space: str, task_id: str) -> bool:
+    """이 공간 원장에 해당 task 흔적이 하나라도 있는가 — executing 고아 plan 판정용(가벼운 조회)."""
+    try:
+        rows, _err = _rows_with_error(_registry_path(space))
+    except Exception:
+        return False
+    return any(row.get("task_id") == task_id for row in rows)
+
+
 def reap_stale_tasks(space: str) -> list[dict]:
     """heartbeat가 끊긴 비종결 작업을 work_dir 상태.json/체크포인트 근거로 강제 finalize한다(자동복구 reaper).
 
@@ -2335,6 +2491,37 @@ def reap_stale_tasks(space: str) -> list[dict]:
     except Exception:
         return results
     stale = [a for a in (snap.get("active_items") or []) if a.get("heartbeat_stale")]
+    # [투명 좀비 회수] 과거 finalize가 비계약 상태(in_progress 등)를 registry에 남긴 작업은
+    # active(running)도 closed도 아니라 위 active_items 스캔에 안 잡힌다(실증 2026-07-02 폴리텍 6ff9:
+    # in_progress로 25분 방치). 최신 상태가 미지 상태인 작업을 직접 걸러 같은 스트랜드 절차
+    # (자동재개→중단보고)로 흘린다. finalize 정규화가 새 발생은 막지만, 이미 새어나간 행과
+    # finalize 도중 크래시가 남길 행을 여기서 자가치유한다.
+    try:
+        _zrows, _zerr = _rows_with_error(_registry_path(space))
+        _zlatest = _latest_tasks(_zrows)
+    except Exception:
+        _zlatest = {}
+    _known_states = {"running", "cancel_requested"} | CLOSED_TASK_STATES
+    for _ztid, _zrow in (_zlatest or {}).items():
+        if str(_zrow.get("state") or "") in _known_states:
+            continue
+        _zrel = str(_zrow.get("work_dir") or "")
+        if not _ztid or not _zrel or not (ROOT / _zrel).exists():
+            continue
+        _zws = _read_json(ROOT / _zrel / "work_status.json", {})
+        _zhb = str(_zws.get("last_heartbeat_at") or _zrow.get("last_heartbeat_at") or "")
+        try:
+            _zage = int((datetime.now() - datetime.fromisoformat(_zhb)).total_seconds() * 1000)
+        except Exception:
+            _zage = TASK_STRAND_REPORT_GRACE_MS + 1  # heartbeat 기록조차 없으면 오래된 좀비로 본다
+        stale.append({
+            "task_id": _ztid,
+            "worker_agent": _zrow.get("worker_agent", ""),
+            "work_dir": _zrel,
+            "heartbeat_stale": True,
+            "heartbeat_age_ms": _zage,
+            "cancel_requested": bool(_zrow.get("cancel_requested")),
+        })
     for item in stale:
         task_id = str(item.get("task_id") or "")
         worker = str(item.get("worker_agent") or "")
@@ -2367,11 +2554,27 @@ def reap_stale_tasks(space: str) -> list[dict]:
                 age_ms = item.get("heartbeat_age_ms")
                 if age_ms is None or age_ms < TASK_STRAND_REPORT_GRACE_MS:
                     continue  # 잠깐 stale일 수 있음(막 끊김) → 보수적으로 더 기다린다
+                # error 종결 전에 체크포인트 자동재개를 먼저 시도한다(클로드코드식 복원 — 실패 보고로
+                # 끝내지 않고 남은 체크포인트에서 잇는다). 재개가 디스패치되면 이 작업은 계속 running.
+                if _try_auto_resume(space, task_id=task_id, worker=worker, work_dir=work_dir, state=state):
+                    results.append({
+                        "space": space, "task_id": task_id, "worker": worker,
+                        "reaped_as": "auto_resumed",
+                    })
+                    continue
+                # 재개 예산 소진/불가 — error로 종결하되, 무엇이 보존됐는지(체크포인트·재개 이력)를
+                # 사유에 남겨 대표·사회자가 '전부 유실'로 오해하지 않게 한다.
+                resume_note = ""
+                resume_marker = _read_json(work_dir / "자동재개.json", {})
+                if int(resume_marker.get("count") or 0) > 0:
+                    resume_note = f", 자동재개 {resume_marker.get('count')}회 시도 후에도 중단"
+                checkpoint_note = f", 체크포인트 보존됨(결과.md {len(result_md.strip())}자)" if result_md.strip() else ""
                 raw_status = {
                     **raw_status,
                     "상태": "error",
                     "사유": (reason + " | " if reason else "")
-                            + "reaper: heartbeat 장기 끊김 무진행 스트랜드 강제 중단 보고(워커 종료/락대기 추정)",
+                            + "reaper: heartbeat 장기 끊김 무진행 스트랜드 강제 중단 보고(워커 종료/락대기 추정)"
+                            + resume_note + checkpoint_note,
                 }
                 _write_json(work_dir / "상태.json", raw_status)
                 finalize_as = "error"  # finalize_task가 error를 blocked_report로 산출 surface

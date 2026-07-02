@@ -61,14 +61,19 @@ def list_dir(path: str = Query("")):
 
 
 @router.post("/upload")
-async def upload(file: UploadFile = File(...), dir: str = Form("자산/추가/업로드")):
-    """파일을 dir(루트 기준) 아래 저장하고 루트 기준 경로 반환. 그 경로를 말풍선 본문에 적으면 미리보기됨."""
+async def upload(file: UploadFile = File(...), dir: str = Form("자산/추가/업로드"), relpath: str = Form("")):
+    """파일을 dir(루트 기준) 아래 저장하고 루트 기준 경로 반환. 그 경로를 말풍선 본문에 적으면 미리보기됨.
+
+    - 스트리밍 저장(청크 4MB) — 대용량 zip·영상도 서버 메모리를 통짜로 먹지 않는다. 상한 4GB(초과 413).
+    - relpath(폴더 첨부의 webkitRelativePath)를 주면 하위 폴더 구조를 보존해 저장한다.
+    """
     try:
-        content = await file.read()
-        path = files.save_upload(dir, file.filename or "file", content)
-        return {"ok": True, "path": path, "name": file.filename, "size": len(content)}
+        path = files.save_upload_stream(dir, file.filename or "file", file.file, relpath=relpath)
+        size = (files.ROOT / path).stat().st_size
+        return {"ok": True, "path": path, "name": file.filename, "size": size}
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        detail = str(exc)
+        raise HTTPException(status_code=413 if "최대 용량" in detail else 400, detail=detail)
 
 
 @router.get("/raw")

@@ -77,6 +77,34 @@ def _attach_skill_growth(item: dict, sdir) -> None:
         item["cases_avoid"] = case_ledger.case_negatives(sdir, limit=3)   # 이중 메모리: 하지 마라
     except Exception:
         pass
+    try:
+        from . import skill_evals
+        item["golden"] = skill_evals.coverage(sdir)   # 골든셋 커버리지(승격 안전도 신호, P1')
+    except Exception:
+        pass
+
+
+def injected_case_refs(hits: list[tuple[int, dict]]) -> list[dict]:
+    """render_context가 프롬프트에 실은 케이스들의 참조 목록을 뽑는다(주입 로그용).
+
+    cases_preview(긍정)·cases_avoid(부정) 둘 다 — 실제로 프롬프트에 노출된 case_id를 그대로 기록한다.
+    """
+    refs = []
+    for _score, item in hits:
+        if item.get("type") != "skill":
+            continue
+        skill = item.get("name", "")
+        for case in item.get("cases_preview", []) or []:
+            cid = case.get("case_id", "")
+            if cid:
+                refs.append({"skill": skill, "case_id": cid,
+                             "polarity": case.get("polarity", ""), "kind": "preview"})
+        for case in item.get("cases_avoid", []) or []:
+            cid = case.get("case_id", "")
+            if cid:
+                refs.append({"skill": skill, "case_id": cid,
+                             "polarity": case.get("polarity", ""), "kind": "avoid"})
+    return refs
 
 
 def score(query: str, item: dict) -> int:

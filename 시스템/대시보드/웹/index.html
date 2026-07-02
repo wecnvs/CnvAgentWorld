@@ -22,7 +22,7 @@
       if (meta) meta.setAttribute("content", theme === "light" ? "#f4f6fa" : "#0e1117");
     })();
   </script>
-  <link rel="stylesheet" href="/static/css/style.css?v=20260702-08">
+  <link rel="stylesheet" href="/static/css/style.css?v=20260702-13">
 </head>
 <body>
   <header class="topbar">
@@ -112,6 +112,7 @@
             <button class="observer-toggle" type="button" data-observer-section="task" aria-pressed="true" aria-controls="room-task-panel">작업</button>
             <button class="observer-toggle" type="button" data-observer-section="candidate" aria-pressed="true" aria-controls="room-candidate-panel">후보</button>
             <button class="observer-toggle" type="button" data-observer-section="promotion" aria-pressed="true" aria-controls="room-promotion-review">성장</button>
+            <button class="observer-toggle" type="button" data-observer-section="roomsummary" aria-pressed="true" aria-controls="room-summary-panel">방요약</button>
             <button class="observer-toggle" type="button" data-observer-section="activity" aria-pressed="true" aria-controls="room-activity">이력</button>
           </div>
         </div>
@@ -125,6 +126,7 @@
           <section class="task-panel" id="room-task-panel" data-empty="yes"></section>
           <section class="candidate-panel" id="room-candidate-panel" data-empty="yes"></section>
           <section class="promotion-review-panel" id="room-promotion-review" data-empty="yes"></section>
+          <section class="room-summary-panel" id="room-summary-panel" data-empty="yes"></section>
           <div class="room-activity" id="room-activity">
             <div class="activity-empty">진행 상황 없음</div>
           </div>
@@ -156,10 +158,12 @@
         </div>
         <button class="room-latest-btn" id="room-latest" type="button" title="최신 대화로 이동" hidden>↓ 최신</button>
         <input type="file" id="room-file" multiple class="hidden-file-input" aria-hidden="true" tabindex="-1">
+        <input type="file" id="room-folder" webkitdirectory multiple class="hidden-file-input" aria-hidden="true" tabindex="-1">
         <form class="room-form" id="room-form">
           <div class="room-manager-lock">공간관리 항상 실행</div>
           <textarea id="room-input" rows="2" placeholder="대표 메시지"></textarea>
-          <label class="ghost room-attach-btn" id="room-attach" for="room-file" title="파일 첨부" role="button" tabindex="0">📎</label>
+          <label class="ghost room-attach-btn" id="room-attach" for="room-file" title="파일 첨부(여러 개·zip 가능, 최대 4GB)" role="button" tabindex="0">📎</label>
+          <label class="ghost room-attach-btn" id="room-attach-folder" for="room-folder" title="폴더 통째 첨부(하위 구조 보존)" role="button" tabindex="0">🗂</label>
           <button class="primary" id="room-send" type="submit">보내기</button>
         </form>
       </section>
@@ -184,6 +188,7 @@
             <span class="cases-hint">스킬 설명과 SKILL.md를 보고, 아래 케이스를 검토</span>
           </div>
           <div id="cases-review-banner" class="cases-review-banner" hidden></div>
+          <div id="cases-promotion-backlog" class="cases-promotion-backlog" hidden></div>
           <div class="cases-split">
             <ul class="cases-skill-list card-list" id="cases-skill-list"></ul>
             <div class="cases-detail" id="cases-detail">
@@ -361,6 +366,22 @@
             <span>이 좌석에서 지정</span>
           </div>
         </label>
+        <label class="field">
+          <span>진행보고 시작 (ms — 이 시간 넘게 걸리면 방에 중간보고)</span>
+          <input id="edit-progress-bubble-after" type="number" min="0" max="3600000" step="10000">
+          <div class="work-override-row" hidden>
+            <input id="edit-progress-bubble-after-override" type="checkbox">
+            <span>이 좌석에서 지정</span>
+          </div>
+        </label>
+        <label class="field">
+          <span>진행보고 간격 (ms — 0이면 중간보고 끔)</span>
+          <input id="edit-progress-bubble-interval" type="number" min="0" max="3600000" step="10000">
+          <div class="work-override-row" hidden>
+            <input id="edit-progress-bubble-interval-override" type="checkbox">
+            <span>이 좌석에서 지정</span>
+          </div>
+        </label>
       </div>
       <label class="field" id="edit-text-wrap" hidden>
         <span>내용</span>
@@ -372,6 +393,6 @@
     </form>
   </div>
 
-  <script type="module" src="/static/js/main.js?v=20260702-08"></script>
+  <script type="module" src="/static/js/main.js?v=20260702-13"></script>
 </body>
 </html>

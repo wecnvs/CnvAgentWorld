@@ -48,6 +48,7 @@ export const api = {
   spaceMessages: (space, limit = 120) =>
     j(`/api/spaces/${encodeURIComponent(space)}/messages?limit=${encodeURIComponent(limit)}`),
   spaceStatus: (space) => j(`/api/spaces/${encodeURIComponent(space)}/status`),
+  spaceSummary: (space) => j(`/api/spaces/${encodeURIComponent(space)}/summary`),
   spaceHandback: (space) => j(`/api/spaces/${encodeURIComponent(space)}/handback`),
   spaceApprovals: (space) => j(`/api/spaces/${encodeURIComponent(space)}/approvals`),
   approvePlan: (space, planId, actor = "대표") =>
@@ -87,16 +88,18 @@ export const api = {
   applyLessonPromotion: (space, promotionId, reason = "승인된 성장 후보를 리소스로 적용", actor = "대표") =>
     j(`/api/spaces/${encodeURIComponent(space)}/learning/promotions/${encodeURIComponent(promotionId)}/apply`, json("POST", { actor, reason })),
   listFiles: (path = "") => j(`/api/files?path=${encodeURIComponent(path)}`),
-  uploadFile: (dir, file) => {
+  uploadFile: (dir, file, relpath = "") => {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("dir", dir);
+    if (relpath) fd.append("relpath", relpath);   // 폴더 첨부: 하위 폴더 구조 보존
     return j("/api/files/upload", { method: "POST", body: fd });   // Content-Type은 브라우저가 boundary와 함께 설정
   },
   // 스킬 케이스(경우의 수) — 대표가 candidate를 검토·승인/강등/폐기
   listSkills: () => j("/api/skills"),
   skillDetail: (skill) => j(`/api/skills/${encodeURIComponent(skill)}`),
   skillsReview: () => j("/api/skills/review"),
+  skillsPromotions: () => j("/api/skills/promotions"),
   skillCases: (skill) => j(`/api/skills/${encodeURIComponent(skill)}/cases`),
   branchCase: (skill, caseId, applies_when, { does_not_apply_when = null, restore_to = null, rationale = "", by = "대표" } = {}) =>
     j(`/api/skills/${encodeURIComponent(skill)}/cases/${encodeURIComponent(caseId)}/branch`,

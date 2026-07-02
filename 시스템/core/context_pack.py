@@ -248,6 +248,31 @@ def _recent_verbatim_messages(space: str, n: int = MAX_VERBATIM_RECENT) -> list[
     return out
 
 
+def _your_recent_statements(space: str, target_agent: str, limit: int = 8, scan: int = 400) -> list[dict]:
+    """이 에이전트 '자신의' 최근 공개 발언 — 사람처럼 '내가 이 방에서 무슨 말·약속을 했는지' 기억할 재료.
+
+    recent_messages(최근 32건)는 바쁜 방에서 자기 발언이 창 밖으로 밀리면 자기 발언 기억이 사라져
+    같은 착수 선언·같은 약속을 반복하는 헛돎이 난다(감사 실증: '백그라운드에서 진행 중' 4회 반복).
+    전체 기록에서 자기 발언만 걸러 마지막 limit건을 준다(작업 기억은 work_situation의
+    your_recent_completed가 담당 — 이것은 '발언' 기억)."""
+    if not target_agent:
+        return []
+    try:
+        rows = read(space, scan)
+    except Exception:
+        return []
+    out = []
+    for row in rows:
+        code = str(row.get("코드") or "")
+        speaker = str(row.get("화자") or "")
+        if code == target_agent or speaker == target_agent:
+            out.append({
+                "event_seq": row.get("event_seq"),
+                "content": str(row.get("내용", ""))[:400],
+            })
+    return out[-limit:]
+
+
 def _source_message(space: str, context: dict | None) -> dict:
     context = context or {}
     source_message_id = str(context.get("source_message_id") or "")
@@ -400,7 +425,8 @@ def _build_work_situation(space: str, target_agent: str = "") -> dict:
         "worker": t.get("worker_agent", ""),
         "state": t.get("state", ""),
         "heartbeat_stale": bool(t.get("heartbeat_stale")),
-        "objective_preview": _active_objective(t.get("work_dir", "")),
+        "task_kind": t.get("task_kind", "user_work"),
+        "objective_preview": t.get("objective_preview") or _active_objective(t.get("work_dir", "")),
     } for t in active][:8]
     pending_rows = [{
         "plan_id": p.get("plan_id", ""),
@@ -518,6 +544,7 @@ def build_context_pack(
         "conflict_hints": memory.get("conflict_hints", {}),
         "room_roster": _room_roster(space, target_agent),
         "work_situation": _build_work_situation(space, target_agent),
+        "your_recent_statements": _your_recent_statements(space, target_agent),
         "current_user_request": {
             "event_seq": source.get("event_seq"),
             "message_id": source.get("message_id", ""),
@@ -561,7 +588,9 @@ def turn_handoff_brief(pack: dict, target_agent: str, manager_message: str, reas
             lines.append(f"- 진행 중 작업: {ws.get('active_task_count', 0)}건 / 결재 대기 계획: {ws.get('pending_approval_count', 0)}건")
             for t in act:
                 stale = " (하트비트 끊김=죽었을 수 있음)" if t.get("heartbeat_stale") else ""
-                lines.append(f"  · [진행중] worker={t.get('worker','')} task={t.get('task_id','')}{stale}: {t.get('objective_preview','')}")
+                # 성장 루프가 자동 생성한 스킬저작 작업은 '대표 요청 산출물'이 아니다 — 명확히 구분 표시.
+                kind = " [시스템 성장:스킬저작 — 대표 요청 작업 아님]" if t.get("task_kind") == "skill_authoring" else ""
+                lines.append(f"  · [진행중]{kind} worker={t.get('worker','')} task={t.get('task_id','')}{stale}: {t.get('objective_preview','')}")
             for p in pend:
                 lines.append(f"  · [결재대기] worker={p.get('worker','')} plan={p.get('plan_id','')}: {p.get('objective_preview','')}")
         else:
@@ -578,6 +607,16 @@ def turn_handoff_brief(pack: dict, target_agent: str, manager_message: str, reas
         if ws.get("note"):
             lines.append(f"- ⚠️ {ws.get('note')}")
         return "\n".join(lines) + "\n"
+
+    def your_statements_block() -> str:
+        items = pack.get("your_recent_statements") or []
+        if not items:
+            return "- (이 방에서 아직 네 발언 없음)\n"
+        out = []
+        for it in items:
+            body = str(it.get("content") or "").replace("\n", " ").strip()
+            out.append(f"- event #{it.get('event_seq', '')}: {body[:260]}")
+        return "\n".join(out) + "\n"
 
     def roster_block() -> str:
         roster = pack.get("room_roster") or []
@@ -690,6 +729,10 @@ def turn_handoff_brief(pack: dict, target_agent: str, manager_message: str, reas
         f"{verbatim_block()}\n"
         "## 이 방의 작업 상황 (착수·요청 전 반드시 확인 — 기계적 반복/중복 금지)\n"
         f"{work_situation_block()}\n"
+        "## 너의 최근 발언(자기 기억) — 네가 이 방에서 이미 한 말\n"
+        "- 사람처럼 자기가 한 말을 기억한 채 참여하라. 같은 착수 선언·같은 약속을 되풀이하지 말고, "
+        "이미 한 약속은 이행 상황(됐는지·진행인지·막혔는지)을 위 작업 상황과 대조해 보고하라.\n"
+        f"{your_statements_block()}\n"
         "## 대표 지시 누적(시간순 전부) · 현재 방향 종합\n"
         "- 아래는 대표가 지금까지 남긴 지시를 event 순서대로 누적한 것이다. 빠짐없이 읽는다.\n"
         "- **입장 변경 규칙**: 나중 지시가 이전 지시와 충돌하면 나중 것을 따른다(대표의 입장이 바뀐 것). "
@@ -942,7 +985,7 @@ def record_pack_delivery(
 _LEDGER_DROP_FIELDS = (
     "space_memory_projection", "recent_messages", "recent_messages_verbatim",
     "space_guide_excerpt", "space_summary_excerpt", "room_roster",
-    "work_situation", "north_star_goals",
+    "work_situation", "north_star_goals", "your_recent_statements",
 )
 
 

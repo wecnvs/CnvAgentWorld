@@ -31,6 +31,8 @@ class WorkSettingsUpdate(BaseModel):
     heartbeat_interval_sec: int | None = None
     heartbeat_stale_ms: int | None = None
     progress_report_due_ms: int | None = None
+    progress_bubble_after_ms: int | None = None
+    progress_bubble_interval_ms: int | None = None
     configured_keys: list[str] | None = None
 
 

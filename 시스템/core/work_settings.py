@@ -20,6 +20,10 @@ DEFAULT_WORK_SETTINGS = {
     "heartbeat_interval_sec": 10,
     "heartbeat_stale_ms": 60_000,
     "progress_report_due_ms": 60_000,
+    # 장기 작업 중간 진행보고 말풍선(방별 조절 — 대표 요청 2026-07-02):
+    # after = 시작 후 이 시간이 지나면 보고 시작, interval = 이후 이 간격마다 1회. interval=0 → 보고 끔.
+    "progress_bubble_after_ms": 120_000,
+    "progress_bubble_interval_ms": 300_000,
 }
 
 SETTING_KEYS = tuple(DEFAULT_WORK_SETTINGS.keys())
@@ -29,6 +33,8 @@ BOUNDS = {
     "heartbeat_interval_sec": (1, 300),
     "heartbeat_stale_ms": (5_000, 3_600_000),
     "progress_report_due_ms": (5_000, 3_600_000),
+    "progress_bubble_after_ms": (0, 3_600_000),
+    "progress_bubble_interval_ms": (0, 3_600_000),   # 0 = 진행보고 끔
 }
 
 

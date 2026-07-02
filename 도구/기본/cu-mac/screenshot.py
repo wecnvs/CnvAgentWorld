@@ -19,7 +19,38 @@ def _hud(msg: str):
     except Exception:
         pass
 
-save_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/cu_screen.png"
+args = sys.argv[1:]
+request_permission = "--request-permission" in args
+no_cursor = "--no-cursor" in args
+pos_args = [a for a in args if not a.startswith("--")]
+save_path = pos_args[0] if pos_args else "/tmp/cu_screen.png"
+
+
+def _screen_capture_allowed() -> bool:
+    fn = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
+    if fn is None:
+        return True
+    try:
+        return bool(fn())
+    except Exception:
+        return True
+
+
+if not _screen_capture_allowed():
+    msg = (
+        "macOS 화면 녹화 권한 없음: 현재 실행 주체에 Screen Recording 권한이 없어 "
+        "창 내용이 빠진 바탕화면 캡처가 될 수 있습니다. 시스템 설정 > 개인정보 보호 및 보안 > "
+        "화면 및 시스템 오디오 녹화(또는 화면 기록)에서 대시보드/터미널/Python 실행 주체를 허용한 뒤 "
+        "대시보드 서버를 재시작하세요. 오인 방지를 위해 캡처를 중단합니다."
+    )
+    _hud("❌ " + msg)
+    print(msg, file=sys.stderr)
+    if request_permission and hasattr(Quartz, "CGRequestScreenCaptureAccess"):
+        try:
+            Quartz.CGRequestScreenCaptureAccess()
+        except Exception:
+            pass
+    sys.exit(2)
 
 cgimg = Quartz.CGWindowListCreateImage(
     Quartz.CGRectInfinite,
@@ -47,7 +78,7 @@ if (img.width, img.height) != (logical_w, logical_h):
 # Quartz 캡처는 하드웨어 커서를 안 찍으므로, 현재 pyautogui 좌표(클릭과 동일계)에
 # 빨강 원+십자선+좌표 라벨을 그려 넣는다. --no-cursor 로 끌 수 있다.
 cursor_xy = None
-if '--no-cursor' not in sys.argv:
+if not no_cursor:
     try:
         from PIL import ImageDraw
         cx, cy = pyautogui.position()

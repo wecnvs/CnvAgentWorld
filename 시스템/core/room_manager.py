@@ -16,12 +16,12 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from .paths import SPACES, SYS
+from .paths import ROOT, SPACES, SYS
 from .transcript import record, read, now_iso, state as transcript_state
-from . import candidate_queue, case_ledger, chat_result, context_pack, engine, knowledge_ledger, lesson_ledger, manager_claim, orchestration, publish_ledger, release_queue, response_obligation, runtime, skill_smith, space_memory, task_registry, work_plan, work_settings
+from . import candidate_queue, case_ledger, chat_result, context_pack, engine, growth_feedback, knowledge_ledger, lesson_ledger, manager_claim, orchestration, publish_ledger, release_queue, resource_body, response_obligation, runtime, skill_smith, space_memory, task_registry, work_plan, work_settings
 from .spaces import MANAGER_DIRNAME, PROJECTION_BASELINE_FILENAME
 from .paths import PEOPLE
-from .codes import split_token
+from .codes import gen_code, split_token
 
 MAX_DECISION_ATTEMPTS = 3
 # 체인이 claim을 쥔 동안 들어온 대표 입력을 release 후 재처리하는 redrive 최대 연쇄.
@@ -116,6 +116,9 @@ MANAGER_DECISION_JSON_CONTRACT = (
     "- propose_case는 대표 피드백/작업 결과를 읽고 '이 스킬의 경우의 수'로 남길 가치가 있다고 네가 판단했을 때만 쓴다(wake/message 비움). "
     'skill(스킬 이름)과 candidate 객체를 넣는다: {"skill":"스킬이름","candidate":{"condition":"어떤 상황","instruction":"그땐 이렇게","polarity":"worked|failed",'
     '"action":"add_case|supersede","routing_kind":"procedural","judgment_rationale":"왜 이렇게 판단했나","source_quote":"근거 발화 요약(개인/회사 식별정보는 일반화)","sensitivity":"public|confidential"}}. '
+    "**이 케이스가 대표의 지시/교정에서 나왔으면 최상위 필드로 `from_user_directive: true`를 함께 넣어라** — 그러면 시스템이 즉시 적용(잠정 우선)하고 "
+    "모순되는 기존 케이스를 (삭제 아니라) 복원가능하게 격리한다. 대표의 명시적 교정이 기존 케이스에 지지 않게 하는 장치다. "
+    "에이전트 관찰·토론에서 나온 케이스면 이 필드를 넣지 마라(그건 candidate로 쌓여 사용 실적으로 수렴한다). "
     "사실/선호(절차 아님)는 case가 아니므로 propose_case 쓰지 말고 아래 라우팅을 따른다. "
     "**action은 보통 add_case다.** supersede(기존 케이스 교체)는 바꿀 기존 case_id를 확실히 알 때만 쓰고 candidate.supersedes에 그 id를 넣는다 — 모르면 add_case로 둔다(시스템이 중복·모순을 정리한다).\n"
     "- **자기성장 라우팅 — 대표가 durable 피드백을 줬을 때 반드시 실제로 저장한다. '기록했다'고 말만 하지 마라:**\n"
@@ -130,6 +133,8 @@ MANAGER_DECISION_JSON_CONTRACT = (
     "  · 위 라우팅으로 **실제 저장**한 뒤에만 대표 피드백을 처리 완료로 본다. 저장 없이 '기억했다'는 거짓 완료다.\n"
     "- **앱 실행(launch_app):** 대표가 **'우리 앱(앱 탭에 등록된 앱) 중 X 실행해줘'**(예: revit 실행)라고 하면 launch_app으로 시스템이 그 앱을 **등록된 실행경로(run_app)** 로 띄운다 — app 필드에 앱 이름이나 앱 폴더경로를 넣는다(예: app=\"Revit\" 또는 \"앱/대외비/원격레빗\"). 시스템이 그 앱의 target(원격 윈도우=cu-helper 등)에서 매니페스트 run을 실행하고 pidfile을 기록해 **대시보드 앱 탭에 '● 실행 중'으로 뜬다**(에이전트가 raw 컴퓨터유즈로 더듬는 것과 다르다 — 그건 대시보드가 모른다). 등록 안 된 임의 프로그램은 못 띄운다(앱 탭 등록 앱만). **단순 실행**이면 launch_app으로 끝. **실행 후 그 앱 화면을 조작(예: revit에서 새 프로젝트 만들기)까지** 해야 하면, launch_app으로 띄운 **뒤** pass로 담당 에이전트에게 넘겨 computer-use로 조작하게 한다. wake는 비운다.\n"
     "- **롤링 누적요약(update_summary):** 대화가 길어지면 오래된 맥락은 최근 창(topic_threads·recent) 밖으로 밀려 사라진다. 그 전에 update_summary로 `요약.md`를 갱신해 **누적 맥락을 압축 보존**한다. message에 **요약.md 전체를 대체할 갱신된 누적요약**을 넣는다 — 기존 요약(space_summary_excerpt)을 버리지 말고 **그 위에 최근 진행을 합쳐 다시 정리**한다(목표·합의된 결정·진행상태·미해결 이슈 중심, 시간순 핵심). 자잘한 잡담은 빼고 '이 방이 지금까지 무엇을 향해 어디까지 왔나'가 한눈에 보이게. wake는 비운다. 이건 방에 공개되는 말풍선이 아니라 내부 누적기록이며, 답할 대표 발언이 따로 있으면 요약을 갱신한 뒤 그 턴을 이어서 처리한다. 새 멤버가 합류했거나 토론·작업이 한 매듭 지어졌을 때가 갱신 적기다.\n"
+    "- **작업 종류 구분 — 성장 작업을 대표 요청 작업으로 착각하지 마라(중요):** RoomStatusSnapshot.tasks.active_items의 각 작업엔 `task_kind`가 있다. `task_kind=skill_authoring`은 **네가 propose_case/propose_skill 할 때 시스템이 자동으로 띄운 '스킬 본문 개선' 작업**이지, **대표가 요청한 산출물이 아니다.** 대표가 '다운로드/제작/조사'를 시켰는데 진행 중인 게 skill_authoring 작업뿐이면, **대표 요청은 아직 안 된 것**이다 — 그걸 대표 작업이 도는 걸로 오인해 stop하지 마라. 대표 요청 작업(`task_kind=user_work`)이 실제로 있는지 objective_preview로 확인하라.\n"
+    "- **'하겠다'는 반드시 실제 착수로 — 말↔행동 분리 금지(대표 원칙):** 대표가 작업(산출물)을 요청했는데 담당자가 '하겠습니다/이어받겠습니다'라고 **말만** 하고 실제 작업(user_work task)이 안 생겼으면(active_items에 그 작업 없음, 결재대기·승인후미착수에도 없음), **stop하지 마라.** 그 담당자를 다시 pass해 request_work로 실제 착수하게 하거나, 구조적으로 막혔으면(권한·환경 부재) 그 사유를 대표에게 보고하라. **무엇부터 할지는 담당자가 바꿔도 되지만, 요청된 일은 거짓 없이 실제로 되거나 정직하게 막힘 보고되어야 한다.** (시스템도 디태치 턴에서 '접수만 하고 미착수'를 감지해 강제 디스패치하지만, 네 판단이 1차 방어선이다.)\n"
     "- **실패에서 배우기(learning.growth_gap_open_items):** RoomStatusSnapshot의 learning 블록에 state=needs_review 인 열린 gap이 보이면, 그건 최근 **실패/반려/교정이 아직 아무 성장으로도 이어지지 않았다**는 신호다. 같은 유형이 반복될 실패면(스킬 오용·절차 누락 등) **propose_case로 케이스화**하고(방 무관 일반 교훈이면 그대로 전파됨), 재사용 사실이면 propose_knowledge로 남긴다. 일회성 환경 문제(일시 타임아웃 등)라 케이스화가 무의미하면 그냥 두라 — 오래된 gap은 시스템이 자동 정리한다. 단 **같은 gap이 여러 번 보이는데 계속 방치하지 마라** — 그게 성장루프 공회전이다.\n"
 )
 
@@ -697,13 +702,21 @@ def _release_redrive(space: str, claim: dict, outcome: str) -> tuple[dict, list[
 # 접수만 하면, 시스템이 그 작업을 강제로 디스패치한다(떠밀기). 매니저가 같은 멤버를 여러 번 떠밀어야
 # 겨우 실행하던 비효율(특히 Gemini)을 한 번에 해소한다.
 _WORK_ACK_RE = re.compile(
-    r"(착수|진행|시작|작성|생성|제작|정리|준비|구현|개발|만들|그려|보완|수정|재작업)\S{0,8}"
-    r"(하겠|할게|하겠습니다|드리겠|드릴게|오겠|와서|보겠|가져오겠|진행)"
+    r"(착수|진행|시작|작성|생성|제작|정리|준비|구현|개발|만들|그려|보완|수정|재작업|"
+    r"이어받|이어서|받아오|받아보|받겠|다운로드|다운|내려받|처리|수행|해두|해놓|맡겠|맡아)\S{0,10}"
+    r"(하겠|할게|하겠습니다|드리겠|드릴게|오겠|와서|보겠|가져오겠|받겠|받아오겠|진행|겠습니다|겠어요|겠음|둘게|둘게요)"
 )
 # 매니저 지시가 '작업'을 시킨 것인지(질문/잡담이 아니라) — 작업 동사/산출물 신호.
 _WORK_INSTRUCTION_RE = re.compile(
     r"(만들|작성|제작|생성|그려|그림|조사|정리|구현|개발|수정|보완|재작업|문서|파일|html|md|마크다운|"
-    r"슬라이드|덱|디자인|코드|이미지|표|차트|배너|카드|보고서|기획안)"
+    r"슬라이드|덱|디자인|코드|이미지|표|차트|배너|카드|보고서|기획안|다운로드|내려받)"
+)
+# 사회자가 '실제 작업(task)을 생성/착수하라'고 **명시적으로** 지시했는지 — 에이전트 말투와 무관한 강한 신호.
+# 이게 있으면(예: "request_work로 user_work 작업을 생성하라") 에이전트가 답을 어떻게 하든(현재형 '띄웁니다',
+# 거짓 '생성했습니다' 등 ack 정규식을 피하는 표현이어도) task 미생성 시 강제 디스패치한다. 의견 요청('의견 줘')엔
+# 안 걸린다(작업 생성 지시가 없으므로). 실증 2026-07-02 폴리텍: pm이 6회 '띄웁니다/생성했습니다'로 회피, ack정규식 무력.
+_WORK_DISPATCH_DIRECTIVE_RE = re.compile(
+    r"(request_work|user_work|작업을?\s*(생성|착수|만들|띄우|디스패치)|백그라운드\s*작업|비동기\s*작업)"
 )
 
 
@@ -772,7 +785,9 @@ def _run_agent_turn(
         _chat_timeout = int(work_settings.resolve_work_settings(space, wake).get("runner_timeout_sec") or 300)
     except Exception:
         _chat_timeout = 300
-    reply = engine.run_engine(seat, engine.prompt_with_discovery(message, handoff_prompt), timeout=max(_chat_timeout, 300))
+    reply = engine.run_engine(seat, engine.prompt_with_discovery(
+        message, handoff_prompt, log_space=space, log_ref=wake, log_kind="chat",
+        log_context=context if isinstance(context, dict) else None), timeout=max(_chat_timeout, 300))
     if _engine_failure_text(reply):
         raise RuntimeError(_public_error_summary(reply))
     if claim is not None and not manager_claim.is_current(space, claim):
@@ -822,9 +837,14 @@ def _run_agent_turn(
             announce_only = True
         elif structured.get("public_reply"):
             reply = str(structured.get("public_reply") or "")
-    # 안전장치(대표 제안): 작업을 시킨 지시에 에이전트가 'request_work' 없이 '하겠습니다'류 접수만 했으면
-    # (말로만, task 미생성) 시스템이 그 작업을 강제 디스패치한다. message=매니저 지시가 작업 신호일 때만.
-    if (not work_routed) and message and _WORK_INSTRUCTION_RE.search(message) and _WORK_ACK_RE.search(reply or ""):
+    # 안전장치(대표 제안): 작업을 시킨 지시에 에이전트가 'request_work' 없이 접수만 했으면(말로만, task 미생성)
+    # 시스템이 그 작업을 강제 디스패치한다. 사회자가 '작업 생성/착수'를 명시 지시했으면(dispatch directive)
+    # 에이전트 말투 무관하게, 또는 작업지시+ack(구식)일 때. message=매니저 지시.
+    _inline_dispatch = (not work_routed) and message and (
+        _WORK_DISPATCH_DIRECTIVE_RE.search(message)
+        or (_WORK_INSTRUCTION_RE.search(message) and _WORK_ACK_RE.search(reply or ""))
+    )
+    if _inline_dispatch:
         forced = _force_work_dispatch(space, wake, message, claim, context, handoff_context_pack, turn_handoff_pack)
         if forced and not (isinstance(forced, dict) and forced.get("plan_gate")):
             announce_only = True   # 접수 말풍선은 공개하되, 작업은 강제로 진행됨
@@ -1014,7 +1034,9 @@ def _run_agent_candidate(
             **_claim_fields(claim),
         })
 
-    prompt = engine.prompt_with_discovery(message, handoff_prompt)
+    prompt = engine.prompt_with_discovery(
+        message, handoff_prompt, log_space=space, log_ref=(turn_id or wake), log_kind="chat",
+        log_context=context if isinstance(context, dict) else None)
     if engine.run_engine is getattr(engine, "_ORIGINAL_RUN_ENGINE", None):
         reply = engine.run_engine_polling(
             seat,
@@ -1080,6 +1102,29 @@ def _run_agent_candidate(
                 "detail": _public_error_summary(exc)[:200],
                 "turn_id": turn_id, **_context_fields(context), **_claim_fields(claim),
             })
+    # [착수-미실행 안전장치 — 디태치 경로 이식] 프로덕션 채팅 턴은 이 detached 경로를 타는데, 종전엔
+    # 여기에 '하겠다고만 하고 request_work 안 한' 경우의 강제 디스패치가 없어(인라인 _run_agent_turn에만
+    # 있었다) 실제 작업이 영영 안 떴다(실증 2026-07-02 폴리텍: pm '이어받겠습니다'만 하고 다운로드 미착수,
+    # 사회자는 다른 작업을 그 다운로드로 오인해 stop). single_pass(매니저가 한 멤버에게 시킨 일반 작업 턴)이고
+    # 매니저 메시지가 '작업 지시'인데 request_work가 없으면, 그 지시를 objective로 작업을 강제 생성한다
+    # (병렬 토론 후보는 '의견'일 수 있으므로 제외). 대표 원칙: '하겠다'는 말은 반드시 실제 착수로 귀결.
+    _cand_work_routed = bool(structured and str(structured.get("action") or "").strip() in {"request_work", "mixed"})
+    # 강제 디스패치 발동: (a) 사회자가 '작업 생성/착수'를 명시 지시했으면 에이전트 말투 무관하게, 또는
+    # (b) 작업 지시 + 에이전트 ack(구식 경로). (a)가 근본 — pm이 '띄웁니다/생성했습니다'로 ack정규식을 피해도 잡는다.
+    _cand_dispatch_directive = bool(message and _WORK_DISPATCH_DIRECTIVE_RE.search(message))
+    _cand_ack = bool(message and _WORK_INSTRUCTION_RE.search(message) and _WORK_ACK_RE.search(candidate_reply or ""))
+    if (join_policy == "single_pass" and not _cand_work_routed and (_cand_dispatch_directive or _cand_ack)):
+        try:
+            forced = _force_work_dispatch(space, wake, message, claim, context, agent_context_pack, turn_handoff_pack)
+            if forced and not (isinstance(forced, dict) and forced.get("plan_gate")):
+                _append_activity(space, {
+                    "상태": "forced_work_dispatch", "시각": now_iso(), "actor": "공간관리", "target": wake,
+                    "label": "착수-미실행 안전장치(디태치): 작업 강제 디스패치",
+                    "detail": f"{wake} 접수만 함 → 지시를 작업으로 떠밂: {str(message)[:80]}",
+                    "turn_id": turn_id, **_context_fields(context), **_claim_fields(claim),
+                })
+        except Exception:
+            pass  # 강제 디스패치 실패해도 후보(접수 말풍선)는 살린다
     enqueue = candidate_queue.enqueue_candidate(
         space,
         turn_id=turn_id,
@@ -1586,6 +1631,12 @@ def _dispatch_work_plan(
             context=context, claim=claim,
             handoff_context_pack=handoff_context_pack, turn_handoff_pack=turn_handoff_pack,
         )
+    try:
+        # 러너 pid를 dispatch 파일에 남긴다 — redispatch가 'mtime 나이'가 아니라 '러너 생존'으로
+        # 유실 여부를 판정하게(15분 넘는 정상 작업을 유실로 오판해 중복 기동하지 않게).
+        _atomic_write_json(dfile, {**json.loads(dfile.read_text(encoding="utf-8")), "runner_pid": proc.pid})
+    except Exception:
+        pass
     _append_activity(space, {
         "상태": "work_dispatched", "시각": now_iso(), "actor": "공간관리", "target": worker,
         "label": "작업 비동기 디스패치", "detail": f"plan={plan_id} pid={proc.pid}", "plan_id": plan_id,
@@ -1610,6 +1661,15 @@ def _execute_work_plan(
 ) -> str:
     """승인된 작업계획을 실제 작업으로 실행한다(engine.work). plan 상태를 executing→done|error로 전이.
     이 함수는 인라인(테스트) 또는 detached 러너(core.run_work) 안에서 호출된다 — 둘 다 동기."""
+    # [중복 기동 차단 — 계획 원장 게이트] task 코드를 먼저 만들어 실행 '전에' plan↔task를 결속한다.
+    # 종전엔 engine.work가 끝난 뒤에야 mark_executing이 불려, 실행 내내 plan이 approved+task 없음으로
+    # 보였고 redispatch_deferred_plans가 15분 뒤 같은 plan을 중복 기동했다(실증 2026-07-02 폴리텍
+    # 26a2/1459 동시 실행). 이제 두 번째 러너는 여기서 WorkPlanError(state=executing)로 즉시 멈춘다.
+    task_id = gen_code()
+    try:
+        work_plan.mark_executing(space, plan_id, task_id=task_id)
+    except work_plan.WorkPlanError as exc:
+        return f"작업 실행 중단(계획 상태 게이트 — 중복 기동/비승인): plan={plan_id}: {exc}"
     try:
         work = engine.work(
             worker,
@@ -1618,6 +1678,7 @@ def _execute_work_plan(
             context=context,
             requested_by=f"chat_agent:{wake}",
             approved_by="space_manager_chat_request",
+            task_id=task_id,
         )
     except Exception as exc:
         try:
@@ -1625,11 +1686,9 @@ def _execute_work_plan(
         except Exception:
             pass
         raise
-    task_id = work.get("작업코드", "")
     state = str(work.get("상태", "")).lower()
     finish = work_plan.ERROR if any(k in state for k in ("error", "에러", "fail", "실패")) else work_plan.DONE
     try:
-        work_plan.mark_executing(space, plan_id, task_id=task_id)
         work_plan.mark_finished(space, plan_id, state=finish, note=str(work.get("상태", ""))[:240])
     except work_plan.WorkPlanError:
         pass
@@ -1774,6 +1833,22 @@ def redispatch_deferred_plans(space: str) -> list[dict]:
                 age_sec = 0.0
             if age_sec < REDISPATCH_STALE_DISPATCH_SEC:
                 continue  # 최근 디스패치 — run_work가 진행 중일 수 있어 건드리지 않는다
+            # mtime 나이만으로 '유실'을 단정하지 않는다 — 15분 넘게 걸리는 정상 작업의 dispatch 파일도
+            # 끝날 때까지 남아 있다(실증 2026-07-02: 26a2 실행 중 redispatch가 1459 중복 기동).
+            # 러너 pid가 살아 있으면 진행 중이므로 건너뛴다(파일 mtime을 갱신해 다음 주기 재검사도 미룸).
+            try:
+                runner_pid = int((_load_json(dfile, {}) or {}).get("runner_pid") or 0)
+                if runner_pid > 0:
+                    os.kill(runner_pid, 0)  # 예외 없음 = 살아있음
+                    dfile.touch()
+                    continue
+            except (ProcessLookupError, ValueError):
+                pass  # 러너 죽음/pid 없음 → 진짜 유실 후보로 진행
+            except PermissionError:
+                dfile.touch()
+                continue
+            except Exception:
+                pass
         try:
             inflight = int(task_registry.snapshot(space).get("active_count") or 0)
         except Exception:
@@ -1807,6 +1882,34 @@ def redispatch_deferred_plans(space: str) -> list[dict]:
         except Exception as exc:
             events.append({"type": "deferred_plan_redispatch_failed", "plan_id": plan_id,
                            "error": _public_error_summary(exc)})
+    # executing 고아 sweep — mark_executing(사전 결속) 후 러너가 태스크 생성 전에 죽으면 plan이
+    # executing에 영구 잔류한다(redispatch는 approved만 본다). 태스크 흔적이 없고 30분 넘게
+    # 방치된 executing plan을 error로 종결·기록해 대표/사회자가 재기동할 수 있게 한다.
+    try:
+        executing_plans = work_plan.list_plans(space, states={work_plan.EXECUTING})
+    except Exception:
+        executing_plans = []
+    for plan in executing_plans:
+        plan_id = str(plan.get("plan_id") or "")
+        tid = str(plan.get("task_id") or "")
+        started_raw = str(plan.get("executing_at_utc") or "")
+        try:
+            age_min = (datetime.now() - datetime.fromisoformat(started_raw)).total_seconds() / 60.0
+        except Exception:
+            continue
+        if age_min < 30:
+            continue
+        try:
+            if tid and task_registry.task_exists(space, tid):
+                continue  # 태스크가 실재 — 살아있거나 reaper 관할
+        except Exception:
+            continue
+        try:
+            work_plan.mark_finished(space, plan_id, state=work_plan.ERROR,
+                                    note="러너 소실(태스크 미생성 executing 고아) — 자동 정리, 필요시 재기동")
+            events.append({"type": "executing_orphan_plan_closed", "plan_id": plan_id})
+        except Exception:
+            pass
     if events:
         _append_activity(space, {
             "상태": "deferred_plan_redispatch", "시각": now_iso(), "actor": "시스템",
@@ -4027,6 +4130,28 @@ def _decision_is_self_growth(result: dict) -> bool:
     return bool((result or {}).get("ok")) and (result.get("decision") or {}).get("action") in SELF_GROWTH_ACTIONS
 
 
+def _case_from_user_directive(decision: dict, cand: dict) -> bool:
+    """이 케이스가 **대표의 지시/교정**에서 나왔나 (P2' 대표 교정 우선권).
+
+    True면 propose_case를 from_daepyo=True로 — 즉시 provisional_must로 적용하고, 모순되는 기존
+    active 케이스는 conflict로 격리(삭제 아님·pre_conflict_status 보존=복원가능)한다. 즉 '즉시 적용되는
+    잠정 최우선 가설'(v2.1). 오검출을 막으려 **명시 신호가 있을 때만** True(에이전트 관찰 케이스엔 과잉적용 금지):
+      - 사회자가 decision.from_user_directive=true 로 선언, 또는
+      - candidate.evidence_level == "user_directive".
+    미선언이면 종전처럼 candidate(안전 기본값).
+    """
+    # LLM이 불리언 대신 문자열("false"/"no")을 낼 수 있으므로 truthy-string 오검출을 막는다
+    # (bool("false")==True 함정). 진짜 참값만 인정한다.
+    def _truthy(v) -> bool:
+        if isinstance(v, bool):
+            return v
+        return str(v or "").strip().lower() in {"true", "1", "yes", "y"}
+
+    if _truthy((decision or {}).get("from_user_directive")):
+        return True
+    return str((cand or {}).get("evidence_level") or "").strip() == "user_directive"
+
+
 def _decision_is_publish_each(result: dict) -> bool:
     """직전 결정이 다자 공개(publish_each)였나 — 토론 반응 라운드를 잇기 위한 판정.
     이후 자동연속은 AUTO_CONTINUE_MAX_TURNS로 상한되며, 토론이 아니면 매니저가 stop한다."""
@@ -4516,6 +4641,47 @@ def _source_health(space: str, *, guide_status: dict | None = None, summary_stat
     }
 
 
+def _manager_wake_balance(space: str, recent: int = 40) -> dict:
+    """최근 사회자 결정에서 멤버별 wake 횟수 분포 — 한 멤버 편중(1인 독백화)을 사회자가 스스로 보게 한다.
+
+    감사 실증(2026-07-02 레빗방): 한 멤버 22회 vs 나머지 각 6회 — 사회자가 자기 wake 이력을 못 보면
+    같은 멤버만 반복해 깨워 다자대화가 독백으로 붕괴한다(목표.md 요구 1). 판단 재료만 준다(기계 차단 아님).
+    """
+    path = SPACES / space / "관리자" / "진행기록.jsonl"
+    counts: dict[str, int] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").strip().splitlines()[-recent:]
+    except Exception:
+        return {}
+    for line in lines:
+        try:
+            decision = (json.loads(line).get("decision") or {})
+        except Exception:
+            continue
+        action = str(decision.get("action") or "")
+        if action == "pass" and decision.get("wake"):
+            counts[str(decision["wake"])] = counts.get(str(decision["wake"]), 0) + 1
+        elif action == "parallel_pass":
+            for t in decision.get("targets") or []:
+                w = str((t or {}).get("wake") or "")
+                if w:
+                    counts[w] = counts.get(w, 0) + 1
+    if not counts:
+        return {}
+    total = sum(counts.values())
+    top = max(counts.values())
+    skewed = len(counts) >= 2 and top >= max(6, int(total * 0.6))
+    return {
+        "recent_decisions": len(lines),
+        "wake_counts": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+        "note": (
+            "⚠️ 최근 wake가 한 멤버에 편중돼 있다(1인 독백 위험). 그 멤버의 작업이 도는 동안 다른 관련 "
+            "멤버(검토·기획 등)로 대화를 진행시켜 여러 목소리를 살려라(law_space '다자 협업 흐름')."
+            if skewed else ""
+        ),
+    }
+
+
 def _prompt_room_status_snapshot(space: str) -> dict:
     try:
         st = status(space)
@@ -4555,6 +4721,7 @@ def _prompt_room_status_snapshot(space: str) -> dict:
         "status_stale": bool(st.get("status_stale")),
         "manager_read_lag": st.get("manager_read_lag", 0),
         "projection_lag": st.get("projection_lag", 0),
+        "wake_balance": _manager_wake_balance(space),
         "work_plans": {
             "pending_approval_count": len(_pending_plans),
             "approved_unstarted_count": len(_unstarted_plans) - len(_pending_plans),
@@ -4671,7 +4838,7 @@ def _prompt_room_status_snapshot(space: str) -> dict:
                 "conversation_thread_id", "room_generation", "source_event_seq",
             ], 8),
             "active_items": _slim_rows(tasks.get("active_items") or [], [
-                "task_id", "worker_agent", "state", "cancel_requested",
+                "task_id", "worker_agent", "state", "task_kind", "objective_preview", "cancel_requested",
                 "cancellation_request_id", "cancellation_reason",
                 "last_heartbeat_at", "heartbeat_phase", "heartbeat_note",
                 "heartbeat_age_ms", "heartbeat_stale", "heartbeat_stale_threshold_ms",
@@ -4919,10 +5086,33 @@ def _dispatch_skill_authoring(space: str, *, skill_name: str, desc: str, cond: s
     if not doer:
         return False
     verb = "새로 작성" if is_new else "개선(고도화)"
+    # P1' 안전판: 기존 스킬 본문을 doer에게 맡기기 *직전*에 현재 본문을 스냅샷으로 박아둔다.
+    # doer가 revise_body를 안 거치고 SKILL.md를 직접 고쳐도 편집 전 원본이 .history에 남아 롤백 가능.
+    if not is_new:
+        try:
+            sdir = case_ledger.skill_dir(skill_name)
+            if sdir:
+                resource_body.ensure_snapshot(sdir / "SKILL.md", by="공간관리",
+                                              reason=f"스킬저작 위임 전 사전 스냅샷: {skill_name}")
+        except Exception:
+            pass
+    if is_new:
+        body_step = (
+            f"2. 대상: 스킬 '{skill_name}' 신규 — 스킬/추가/{skill_name}/SKILL.md에 첫 버전을 작성한다. "
+            f"frontmatter에 version:1 을 넣는다.\n")
+    else:
+        body_step = (
+            f"2. 대상: 기존 스킬 '{skill_name}'의 본문 개선. **SKILL.md를 직접 덮어쓰지 말고**, 개선안을 임시파일로 쓴 뒤 "
+            f"`python3 시스템/엔진/world.py skill-revise-body --skill {skill_name} --body-file <임시파일> "
+            f"--by {doer} --rationale \"<무엇을 왜\"> --case-ids \"<종합한 case_id들 콤마구분>\" "
+            f"--regression \"<기존 active 케이스를 새 본문에 비춰본 회귀 점검 결과>\"` 로 적용한다. "
+            f"이 경로가 이전 본문을 .history에 스냅샷(롤백가능)하고 CAS·non_overridable·N케이스(≥2) 게이트를 건다.\n"
+            f"   - 게이트가 거부하면(케이스가 2건 미만으로 수렴 등) **본문을 고치지 말고** 그대로 두고 결과.md에 "
+            f"'본문 미개정(게이트 미충족) — 케이스만 반영됨'이라 보고한다(단일 케이스로 본문 고정 금지, 설계 P3).\n")
     objective = (
         f"[스킬 저작 — skill-creator 기준] 스킬 '{skill_name}'을 {verb}하라. 크루드 템플릿 금지, 제대로 만든다.\n"
         f"1. 발견기로 'skill-creator' 스킬을 찾아 그 절차·기준(언제 쓰나·핵심 원칙·절차·안티패턴 구조 + 발견 최적화 description)을 따른다.\n"
-        f"2. 대상: 스킬 '{skill_name}' — 이미 있으면 그 SKILL.md 본문을 개선, 없으면 스킬/추가/{skill_name}/에 신규 작성.\n"
+        f"{body_step}"
         f"3. 담을 핵심 교훈: 조건='{cond}', 지시='{instr}'. (케이스는 cases.jsonl에 이미 반영됨 — 본문엔 보편 절차로 녹여라.)\n"
         f"4. description(발견용): {desc}\n"
         f"5. 작성 후 부를 표현 3개로 발견기 검색해 top-3에 뜨는지 확인, 안 뜨면 description 보강.\n"
@@ -4931,15 +5121,18 @@ def _dispatch_skill_authoring(space: str, *, skill_name: str, desc: str, cond: s
     assessment = {"needs_approval": False, "approval_mode": "auto_manager", "system_level": "low",
                   "system_signals": [], "approval_reason": "스킬 저작(저위험 내부 작업)",
                   "agent_needs_approval": False, "agent_level": "low", "agent_reason": ""}
+    # 이 작업은 '성장 루프'가 자동 생성한 스킬저작이지 대표가 요청한 산출물이 아니다 — task_kind로 표시해
+    # 사회자가 이걸 대표 요청 작업으로 오인해 stop하지 않게 한다(실증 2026-07-02 폴리텍 ff22 오인).
+    growth_context = {**(context or {}), "task_kind": "skill_authoring"}
     try:
         registered = work_plan.register(space, requesting_agent="공간관리", worker=doer,
                                         objective=objective, plan_steps=[f"skill-creator로 '{skill_name}' {verb}"],
-                                        assessment=assessment, context=context)
+                                        assessment=assessment, context=growth_context)
         plan_id = registered["record"]["plan_id"]
         work_plan.approve(space, plan_id, actor="공간관리", mode="auto_manager", reason="스킬 저작 자동승인(저위험)")
         effect_id = orchestration.effect_id("skill_authoring", space, skill_name, (context or {}).get("intent_id", ""))
         _dispatch_work_plan(space, plan_id=plan_id, wake="공간관리", worker=doer,
-                            objective_for_work=objective, effect_id=effect_id, context=context, claim=claim,
+                            objective_for_work=objective, effect_id=effect_id, context=growth_context, claim=claim,
                             handoff_context_pack={}, turn_handoff_pack={})
         _publish_manager_note(
             space, f"📌 '{skill_name}' 스킬을 skill-creator 기준으로 {verb}하는 작업을 {doer.rsplit('_', 1)[0]}에게 맡겼어요(고도화).",
@@ -5626,6 +5819,114 @@ def tick(space: str, event: str = "방 진행 필요", context: dict | None = No
 REFLOW_MAX_PER_CALL = 5   # 한 번 reflow에서 공개할 결과 상한(오래된 것부터, 폭주 방지)
 
 
+# 장기 실행 작업의 중간 진행보고 말풍선 — 시작 후 after가 지나면 보고를 시작하고, 이후 interval마다 1회.
+# 결정적(LLM 호출 없음): work_status heartbeat + 결과.md 체크리스트에서 요약을 만든다. 스팸 방지는
+# effect_id(간격 버킷) 멱등 + work_status 마커의 이중 가드. 죽은 작업(stale heartbeat)은 reaper 몫이라 제외.
+# 시점은 방별 조절: 공간 작업실행설정(progress_bubble_after_ms / progress_bubble_interval_ms, 0=끔).
+
+
+def _progress_bubble_policy(space: str) -> tuple[int, int]:
+    """방별 진행보고 시점(after_ms, interval_ms) — 공간 작업실행설정에서 읽고 없으면 기본값."""
+    try:
+        cfg = work_settings.normalize_settings(work_settings.read_folder_settings(SPACES / space))
+        return int(cfg["progress_bubble_after_ms"]), int(cfg["progress_bubble_interval_ms"])
+    except Exception:
+        d = work_settings.DEFAULT_WORK_SETTINGS
+        return int(d["progress_bubble_after_ms"]), int(d["progress_bubble_interval_ms"])
+
+
+def _checkpoint_progress_counts(result_md: str) -> tuple[int, int]:
+    done = sum(1 for line in result_md.splitlines() if "- [x]" in line.lower())
+    open_ = sum(1 for line in result_md.splitlines() if "- [ ]" in line)
+    return done, done + open_
+
+
+def publish_task_progress_bubbles(space: str) -> list[dict]:
+    """오래 걸리는 라이브 작업의 진행 상황을 방 말풍선으로 중간 보고한다(대표 요청 2026-07-02).
+
+    종전엔 진행 상황이 대시보드 작업 패널(heartbeat)에만 보이고 대화에는 완료/실패 때만 올라와,
+    방에서는 '지금 무엇이 어디까지 됐는지'를 알 수 없었다. 신선한 heartbeat의 러닝 작업만 대상
+    (죽은 작업은 reaper가 자동재개/중단보고). 워커 명의의 정보성 말풍선이며 응답의무·세대에 관여하지 않는다.
+    """
+    out: list[dict] = []
+    after_ms, interval_ms = _progress_bubble_policy(space)
+    if interval_ms <= 0:
+        return out  # 이 방은 중간 진행보고 끔(공간 설정)
+    try:
+        snap = task_registry.snapshot(space)
+    except Exception:
+        return out
+    now_dt = datetime.now()
+    for item in snap.get("active_items") or []:
+        if item.get("heartbeat_stale"):
+            continue  # 죽었거나 멈춤 — 진행보고 대상 아님(reaper 경로)
+        rel = str(item.get("work_dir") or "")
+        task_id = str(item.get("task_id") or "")
+        if not rel or not task_id:
+            continue
+        wdir = ROOT / rel
+        ws = _load_json(wdir / "work_status.json", {})
+        try:
+            started = datetime.fromisoformat(str(ws.get("started_at") or ""))
+            elapsed_ms = int((now_dt - started).total_seconds() * 1000)
+        except Exception:
+            continue
+        if elapsed_ms < after_ms:
+            continue
+        try:
+            last_bubble = datetime.fromisoformat(str(ws.get("last_progress_bubble_at") or ""))
+            if (now_dt - last_bubble).total_seconds() * 1000 < interval_ms:
+                continue
+        except Exception:
+            pass  # 마커 없음 = 첫 보고
+        worker_token = str(item.get("worker_agent") or "")
+        if worker_token and "_" in worker_token:
+            speaker_disp, speaker_cd = split_token(worker_token)
+        else:
+            speaker_disp, speaker_cd = worker_token or "작업자", worker_token or "worker"
+        objective = ""
+        try:
+            objective = str(json.loads((wdir / "task_pack.json").read_text(encoding="utf-8")).get("objective") or "")
+        except Exception:
+            pass
+        result_md = ""
+        try:
+            result_md = (wdir / "결과.md").read_text(encoding="utf-8")
+        except Exception:
+            pass
+        done, total = _checkpoint_progress_counts(result_md)
+        minutes = max(1, elapsed_ms // 60_000)
+        note = str(ws.get("heartbeat_note") or ws.get("heartbeat_phase") or "").strip()
+        parts = [f"⏳ 진행 보고(자동) — {objective[:90] or task_id}", f"{minutes}분 경과"]
+        if total:
+            parts.append(f"단계 {done}/{total} 완료")
+        # 내부 폴링 노트(engine_poll / elapsed=NNNs)는 사람에게 정보가 아니다 — 실제 작업 노트만 보여준다.
+        if note and note != "engine_poll" and not re.fullmatch(r"elapsed=\d+s", note):
+            parts.append(f"지금: {note[:140]}")
+        content = " · ".join(parts) + " — 계속 진행 중입니다."
+        bucket = elapsed_ms // interval_ms
+        effect = orchestration.effect_id("task_progress_bubble", space, task_id, str(bucket))
+        try:
+            res = record(space, {
+                "시각": now_iso(), "공간": space,
+                "화자": speaker_disp, "코드": speaker_cd, "역할": "assistant",
+                "내용": content, "유형": "진행보고", "task_id": task_id,
+                "effect_id": effect,
+            }, dedupe_effect_id=True)
+        except Exception:
+            continue
+        if res.get("duplicate"):
+            continue
+        try:
+            ws2 = _load_json(wdir / "work_status.json", {})
+            ws2["last_progress_bubble_at"] = now_iso()
+            (wdir / "work_status.json").write_text(json.dumps(ws2, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        out.append({"type": "task_progress_bubble", "task_id": task_id, "worker": worker_token})
+    return out
+
+
 def reflow(space: str) -> dict:
     """완료된 (비동기 디스패치) 작업 결과를 대화로 회수·공개한다 (설계_대화작업분리 Phase B).
 
@@ -5711,6 +6012,11 @@ def reflow(space: str) -> dict:
         pass
     try:
         lesson_ledger.expire_stale_growth_gaps(space)
+    except Exception:
+        pass
+    # 장기 실행 작업 중간 진행보고 — 오래 걸리는 작업은 완료 전에도 방 말풍선으로 상황을 알린다(대표 요청).
+    try:
+        events.extend(publish_task_progress_bubbles(space))
     except Exception:
         pass
     return {"ok": True, "published": published, "pending_remaining": max(0, len(pending) - published), "events": events}
@@ -6773,8 +7079,13 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
         if str(cand.get("action") or "").strip() == "supersede" and not (_sup if isinstance(_sup, list) else str(_sup or "").strip()):
             cand["action"] = "add_case"
             cand.pop("supersedes", None)
+        # P2' 대표 교정 우선권: 대표 지시/교정에서 나온 케이스면 즉시 적용(provisional_must) + 기존 모순
+        # active 케이스는 conflict로 격리(복원가능). 미선언이면 종전대로 candidate(안전 기본값).
+        _from_daepyo = _case_from_user_directive(decision, cand)
         try:
-            record = case_ledger.propose_case(skill, cand, proposed_by="공간관리", from_daepyo=False)
+            record = case_ledger.propose_case(skill, cand,
+                                              proposed_by=("대표" if _from_daepyo else "공간관리"),
+                                              from_daepyo=_from_daepyo)
             _append_activity(space, {
                 "상태": "case_proposed", "시각": now_iso(), "actor": "공간관리",
                 "target": skill, "label": "스킬 케이스 발의(candidate)",
@@ -6783,6 +7094,26 @@ def _tick_unlocked(space: str, event: str = "방 진행 필요", context: dict |
             })
             events.append({"type": "case_proposed", "skill": skill,
                            "case_id": record.get("case_id", ""), "status": record.get("status", "")})
+            # P2' 부정 루프(섀도): 대표가 이 스킬의 결과를 '틀렸다'(polarity=failed)고 교정하면, 그 스킬의
+            # 최근 노출(preview) 케이스를 harmful 원인 후보로 역추적한다. 기본은 섀도(판단·로그만) —
+            # 실제 harmful 기록/강등은 CNV_GROWTH_HARMFUL_ACTIVE / CNV_GROWTH_DEMOTE_ACTIVE 플래그로만.
+            if _from_daepyo and str(cand.get("polarity") or "").strip() == "failed":
+                try:
+                    fb = growth_feedback.on_skill_correction(
+                        space, skill, corrected_by="대표", new_case_id=record.get("case_id", ""),
+                        rationale=str(cand.get("judgment_rationale") or cand.get("condition") or "")[:200])
+                    if fb.get("suspects"):
+                        events.append({"type": "harmful_backtrace", "skill": skill,
+                                       "suspects": fb["suspects"], "shadow": fb.get("shadow", True),
+                                       "harmful_applied": fb.get("harmful_applied", [])})
+                        _append_activity(space, {
+                            "상태": "harmful_backtrace", "시각": now_iso(), "actor": "시스템자동",
+                            "target": skill,
+                            "label": ("harmful 역추적(섀도)" if fb.get("shadow") else "harmful 역추적(적용)"),
+                            "detail": f"원인후보 {len(fb['suspects'])}건: {', '.join(fb['suspects'][:3])}",
+                            **_context_fields(context), **_claim_fields(claim)})
+                except Exception:
+                    pass
             _publish_manager_note(space, f"📌 '{skill}' 스킬에 케이스로 반영했어요: {str(cand.get('condition',''))[:100]}", context, claim)
             # 케이스만 쌓지 말고 본문도 고도화: doer에게 skill-creator 기준 본문 개선을 위임(대표 '다듬어줘'=계속 고도화).
             _dispatch_skill_authoring(space, skill_name=skill,

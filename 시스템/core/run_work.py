@@ -71,11 +71,47 @@ def _run(dispatch_file: str) -> int:
     return result
 
 
+def _run_resume(work_dir: str) -> int:
+    """죽은 워커 작업을 같은 폴더에서 체크포인트부터 이어서 재실행한다(reaper 자동재개 경로).
+
+    reaper(task_registry.reap_stale_tasks)가 'heartbeat 장기 끊김 + 재개 예산 남음' 스트랜드를
+    발견하면 error 종결 대신 이 모드를 detached로 띄운다: python -m core.run_work --resume <작업폴더>
+    """
+    from . import engine
+
+    wdir = Path(work_dir)
+    space = ""
+    try:
+        space = json.loads((wdir / "task_pack.json").read_text(encoding="utf-8")).get("space_id") or ""
+    except Exception:
+        pass
+    try:
+        engine.resume_work(wdir)
+        result = 0
+    except Exception as exc:
+        sys.stderr.write(f"run_work: 자동재개 실패 {work_dir}: {type(exc).__name__}: {exc}\n")
+        result = 1
+    finally:
+        # 재개가 끝났으면(성공·실패 모두 finalize_task까지 감) 결과를 곧바로 방으로 회수·공개한다.
+        if space:
+            try:
+                from . import room_manager
+                room_manager.reflow_safe(space)
+            except Exception:
+                pass
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
-        sys.stderr.write("용법: python -m core.run_work <dispatch_file.json>\n")
+        sys.stderr.write("용법: python -m core.run_work <dispatch_file.json> | --resume <작업폴더>\n")
         return 2
+    if argv[0] == "--resume":
+        if len(argv) < 2:
+            sys.stderr.write("용법: python -m core.run_work --resume <작업폴더>\n")
+            return 2
+        return _run_resume(argv[1])
     return _run(argv[0])
 
 

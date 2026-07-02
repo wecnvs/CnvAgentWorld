@@ -1,6 +1,6 @@
 // 스킬 검토 패널 — 스킬 설명/SKILL.md를 보고, 그 아래 케이스를 검토한다.
 // §9.1: 자동 격리된 모순(conflict)을 전 스킬 통합 배너로 노출하고, 조건 좁혀 분기(branch)로 해소한다.
-import { api } from "./api.js?v=20260702-08";
+import { api } from "./api.js?v=20260702-13";
 
 let selectedSkill = null;
 let reviewIndex = {};   // skill name -> { conflicts, review }
@@ -17,6 +17,7 @@ export async function renderCases() {
   const listEl = document.getElementById("cases-skill-list");
   if (!listEl) return;
   await renderReviewBanner();   // 통합 검토큐 먼저(어떤 스킬에 모순이 있는지 인덱스 채움)
+  await renderPromotionBacklog();  // 승격 대기 백로그(대표 원클릭 승격 — candidate 적체 해소)
   let skills = [];
   try {
     skills = await api.listSkills();
@@ -95,6 +96,69 @@ async function renderReviewBanner() {
     chips.append(chip);
   });
   banner.append(chips);
+}
+
+// ── 승격 대기 백로그 — candidate 적체(감사: 75/100)를 대표가 훑고 원클릭 승격/폐기 ──
+async function renderPromotionBacklog() {
+  const box = document.getElementById("cases-promotion-backlog");
+  if (!box) return;
+  let data;
+  try {
+    data = await api.skillsPromotions();
+  } catch (e) {
+    box.hidden = true;
+    return;
+  }
+  const items = data.items || [];
+  if (!items.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = "";
+  const head = el("div", "promotion-backlog-head",
+    `승격 대기 ${data.total}건${data.ready_count ? ` (준비완료 ${data.ready_count}건 ⭐)` : ""} — 승격하면 확정 규칙으로 모든 방에 적용됩니다`);
+  box.append(head);
+  const list = el("div", "promotion-backlog-list");
+  // 준비완료·worked 순으로 이미 정렬돼 옴. 과부하 방지로 상위 30건만, 나머지는 개수 고지.
+  items.slice(0, 30).forEach((it) => {
+    const row = el("div", "promotion-backlog-row" + (it.ready_to_promote ? " ready" : ""));
+    const mark = it.ready_to_promote ? "⭐ " : "";
+    const pol = it.polarity === "failed" ? "⛔" : "✅";
+    row.append(el("div", "promotion-backlog-body",
+      `${mark}[${it.skill}] ${pol} ${it.condition} → ${it.instruction}` +
+      (it.worked ? ` (worked ${it.worked})` : "")));
+    const actions = el("div", "promotion-backlog-actions");
+    const promoteBtn = el("button", "ghost small", "승격");
+    promoteBtn.type = "button";
+    promoteBtn.onclick = async () => {
+      promoteBtn.disabled = true;
+      try {
+        await api.promoteCase(it.skill, it.case_id, "대표 승격(승격 대기 백로그)");
+      } catch (e) { alert(`승격 실패: ${e.message || e}`); }
+      renderCases();
+    };
+    const retireBtn = el("button", "danger small", "폐기");
+    retireBtn.type = "button";
+    retireBtn.onclick = async () => {
+      retireBtn.disabled = true;
+      try {
+        await api.retireCase(it.skill, it.case_id, "대표 폐기(승격 대기 백로그)");
+      } catch (e) { alert(`폐기 실패: ${e.message || e}`); }
+      renderCases();
+    };
+    const openBtn = el("button", "ghost small", "열기");
+    openBtn.type = "button";
+    openBtn.onclick = () => { selectedSkill = it.skill; renderCases(); };
+    actions.append(promoteBtn, retireBtn, openBtn);
+    row.append(actions);
+    list.append(row);
+  });
+  if (items.length > 30) {
+    list.append(el("div", "promotion-backlog-more", `… 외 ${items.length - 30}건 (승격/폐기하면 이어서 표시)`));
+  }
+  box.append(list);
 }
 
 async function renderSkillDetail(skill) {
